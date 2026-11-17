@@ -1,0 +1,102 @@
+ASM-ERSA Custom Community License Agreement
+Version 1.0 – 2026
+
+Copyright © 2026 ASM-ERSA Project Owner. All rights not expressly granted are reserved.
+
+IMPORTANT NOTICE:
+
+This Agreement governs all deliverables of the ASM-ERSA project, including but not limited to: source code, model weights (including full-precision, quantized, and Omni multimodal weights), compiled inference binaries, the inference engine, and documentation.
+
+This is NOT an OSI (Open Source Initiative) approved open source license. Whether the source code is made publicly visible is at the sole discretion of the copyright holder; public visibility does not grant any rights beyond those set out in this Agreement.
+
+1. Definitions and Interpretation
+
+1.1 "Software" means the ASM-ERSA project and all its deliverables, including source code, model weights, inference binaries, related documentation, and any subsequent updates.
+
+1.2 "You" means the natural person or legal entity exercising the rights granted under this Agreement.
+
+1.3 "Revenue" means total income over any consecutive twelve (12) month period, including main business income and other business income, without deduction of any costs, expenses, or taxes. If You are a legal entity, Revenue is calculated on a consolidated basis for the parent company, subsidiaries, entities under common control of the same ultimate beneficial owner, and branches.
+
+1.4 "Commercial Use" means any use for profit, or in a production environment, or to provide services to third parties, or integrated into products sold to third parties — in short, any commercial scenario.
+
+2. Grant of License
+
+Subject to Your compliance with all terms of this Agreement, the copyright holder grants You a worldwide, royalty-free, non-exclusive, non-transferable, non-sublicensable, limited right to:
+
+(a) install, use, and reproduce the Software;
+(b) modify the source code, for internal purposes only;
+(c) distribute unmodified copies of the Software, provided that this Agreement is included in full.
+
+3. Eligibility for Free Use and Restrictions
+
+3.1 Individuals, academic institutions, and non-profit organizations may use the Software free of charge for personal study, academic research, and non-profit purposes.
+
+3.2 Rules for commercial organizations:
+
+(1) A commercial organization whose consolidated Revenue over any consecutive twelve (12) month period does not exceed RMB 5,000,000 (Five Million Yuan) may use the Software free of charge;
+
+(2) A commercial organization whose consolidated Revenue over any consecutive twelve (12) month period exceeds RMB 5,000,000 (Five Million Yuan) must obtain prior written commercial authorization from the copyright holder, and is otherwise prohibited from using the Software in any external commercial product, external service, commercial hosting, or production deployment;
+
+(3) Revenue is measured on a rolling twelve (12) month basis, with the date of use as the assessment reference date;
+
+(4) Aggregation of affiliates: Revenue of the parent company, subsidiaries, entities under common control of the same ultimate beneficial owner, and branches shall be aggregated. Splitting entities to circumvent this Agreement is prohibited.
+
+3.3 Exceeding the free threshold: within thirty (30) calendar days from the date the threshold is exceeded, You must either (a) purchase a commercial license, or (b) cease all use of the Software and delete all copies.
+
+4. Compliance Audit
+
+The copyright holder may request in writing that a commercial user provide audited financial statements or other reliable supporting materials to verify that its Revenue is below the free threshold. Audits shall be conducted no more than once per year. Routine audit costs shall be borne by the copyright holder; if a violation of use is confirmed, all resulting costs shall be borne by the user.
+
+5. Prohibited Conduct
+
+Without the prior written permission of the copyright holder, You may not:
+
+(a) use the Software for any activity that violates the laws and regulations of the People's Republic of China, including but not limited to military, espionage, surveillance, or nuclear weapons-related purposes;
+
+(b) provide commercial hosting of the Software to third parties, or provide commercial APIs, SaaS, or other services to third parties based on the Software;
+
+(c) remove, obscure, or alter any copyright notice, license notice, or attribution in the Software;
+
+(d) reverse engineer, decompile, or disassemble the binaries or other deliverables of the Software;
+
+(e) redistribute modified versions of the Software (except for internal use).
+
+6. Intellectual Property
+
+6.1 All copyrights, trademark rights, and other intellectual property rights in the Software belong to the ASM-ERSA Project Owner.
+
+6.2 By submitting code, documentation, or other content to this project, contributors agree to grant the project owner, under a Contributor License Agreement (CLA), the right to distribute their contributions under this Agreement and any subsequent version.
+
+7. Disclaimer of Warranty
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT. YOU BEAR ALL RISKS ARISING FROM THE USE OF THE SOFTWARE.
+
+8. Limitation of Liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE COPYRIGHT HOLDER SHALL NOT BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, OR CONSEQUENTIAL DAMAGES. THE COPYRIGHT HOLDER'S TOTAL CUMULATIVE LIABILITY TO YOU SHALL NOT EXCEED RMB 0 (ZERO YUAN).
+
+9. Termination
+
+This Agreement terminates automatically upon any breach by You, and You must immediately cease use of and destroy all copies of the Software. Sections 6, 7, 8, and 10 shall survive termination.
+
+10. Governing Law and Dispute Resolution
+
+This Agreement is governed by the laws of the People's Republic of China. Any dispute arising out of or in connection with this Agreement shall be resolved through friendly negotiation; failing that, the dispute shall be submitted to the Haidian District People's Court of Beijing.
+
+11. Commercial Licensing Upgrade
+
+To use the Software beyond the free threshold, or to obtain the following services, please contact the copyright holder for a commercial license:
+
+- Commercial use authorization without any revenue limit
+- Enterprise-grade technical support (with SLA response)
+- Custom development for the Vulkan tensor system and edge-device deployment
+- Model quantization and deployment toolchain
+- Custom training, fine-tuning, and distillation services
+
+Contact: 1393475440@qq.com
+
+---
+
+The final right of interpretation of this Agreement belongs to the ASM-ERSA project.
+
+Copyright © 2026 ASM-ERSA Project Owner

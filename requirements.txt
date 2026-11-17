@@ -1,0 +1,11 @@
+torch>=2.0.0
+safetensors>=0.3.0
+transformers>=4.30.0
+
+# 音频 I/O：soundfile 读 wav，log-mel 由 asm_ersa/audio_io.py 用 torch.stft 实现
+# 不依赖 torchaudio —— 它要求与 torch 版本严格匹配，装错会连带破坏 torch
+soundfile>=0.12.0
+
+# 图像加载与预处理（Omni 数据管线）
+Pillow>=10.0.0
+torchvision>=0.15.0
