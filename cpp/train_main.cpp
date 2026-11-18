@@ -978,7 +978,7 @@ int main(int argc, char** argv) {
                 const std::uint32_t N = t + 1;
                 const std::uint32_t NB = (N + cfg.block_size - 1) / cfg.block_size;
                 const ErsaBwdPC ep{1, H, T, N, DK, DV, NB, cfg.block_size,
-                                   cfg.top_blocks, cfg.window, t, NBmaxT, 1.0f,
+                                   cfg.top_blocks, cfg.window, t, NBmaxT, 0.005f,
                                    L.sink_value, 0.0f, 0.0f};
                 提交2("ersa_attn_bwd_query",
                       {L.q_hist.取句柄(), L.k_hist.取句柄(), L.v_hist.取句柄(),
@@ -988,19 +988,15 @@ int main(int argc, char** argv) {
             }
 
             const L2BwdPC l2q{H * T, DK, 0, 1};
-            const L2BwdPC l2k{H * T, DK, H * T, 1};
             提交2("l2norm_bwd",
                   {L.q_hist.取句柄(), dQH.取句柄(), L.qkv_norm.取句柄(), dqRawH.取句柄()},
                   &l2q, sizeof(l2q), H * T, 1, 1);
-            提交2("l2norm_bwd",
-                  {L.k_hist.取句柄(), dKH.取句柄(), L.qkv_norm.取句柄(), dkRawH.取句柄()},
-                  &l2k, sizeof(l2k), H * T, 1, 1);
 
             const HeadsPC th{H, T, DK, 0};
             const HeadsPC tv{H, T, DV, 0};
             提交2("transpose_heads", {dqRawH.取句柄(), dqT.取句柄()}, &th, sizeof(th),
                   (H * T * DK + 255u) / 256u, 1, 1);
-            提交2("transpose_heads", {dkRawH.取句柄(), dkT.取句柄()}, &th, sizeof(th),
+            提交2("transpose_heads", {dKH.取句柄(), dkT.取句柄()}, &th, sizeof(th),
                   (H * T * DK + 255u) / 256u, 1, 1);
             提交2("transpose_heads", {dVH.取句柄(), dvT.取句柄()}, &tv, sizeof(tv),
                   (H * T * DV + 255u) / 256u, 1, 1);
@@ -1226,7 +1222,7 @@ int main(int argc, char** argv) {
                     const std::uint32_t N = t + 1;
                     const std::uint32_t NB = (N + cfg.block_size - 1) / cfg.block_size;
                     const ErsaStepPC pc{B, H, T, N, DK, DV, NB, cfg.block_size,
-                                        cfg.top_blocks, cfg.window, t, NBmaxT, 1.0f,
+                                        cfg.top_blocks, cfg.window, t, NBmaxT, 0.005f,
                                         L.sink_value};
                     提交2("ersa_attn_step",
                           {L.q_hist.取句柄(), L.k_hist.取句柄(), L.v_hist.取句柄(),

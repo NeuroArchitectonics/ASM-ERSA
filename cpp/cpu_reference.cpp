@@ -221,6 +221,7 @@ void ersa_step(const std::vector<float>& qh, const std::vector<float>& kh,
                uint32_t NB, uint32_t BLOCK, uint32_t TOPB, uint32_t WINDOW,
                uint32_t t, float sink, uint32_t NBmax, float* out) {
     const float scale = 1.0f / std::sqrt(float(DK));
+    const float tau = 0.005f;
     std::vector<float> bscore(NB);
 
     for (uint32_t h = 0; h < H; ++h) {
@@ -230,7 +231,7 @@ void ersa_step(const std::vector<float>& qh, const std::vector<float>& kh,
             for (uint32_t d = 0; d < DK; ++d) {
                 s += q[d] * bs[std::size_t(h) * NBmax * DK + std::size_t(bi) * DK + d];
             }
-            bscore[bi] = s * scale;
+            bscore[bi] = s * scale / tau;
         }
 
         const std::vector<uint32_t> top = top_r(bscore, std::min(TOPB, NB));
@@ -256,7 +257,7 @@ void ersa_step(const std::vector<float>& qh, const std::vector<float>& kh,
             for (uint32_t d = 0; d < DK; ++d) {
                 s += q[d] * kh[std::size_t(h) * Tmax * DK + std::size_t(idx) * DK + d];
             }
-            sc[i] = s * scale;
+            sc[i] = s * scale / tau;
             mx = std::max(mx, sc[i]);
         }
         float sum = std::exp(sink - mx);
@@ -514,7 +515,7 @@ std::vector<float> cpu_forward(const ModelConfig& cfg, const ModelWeights& weigh
             linear(x.data(), Wk.data(), nullptr, k_raw.data(), 1, D, HDK);
             linear(x.data(), Wv.data(), nullptr, v_cur.data(), 1, D, HDV);
             l2norm_rows(q_raw.data(), H, DK);
-            l2norm_rows(k_raw.data(), H, DK);
+            if (!lw.is_ersa) l2norm_rows(k_raw.data(), H, DK);
 
             if (lw.is_ersa) {
                 const uint32_t N = t + 1;

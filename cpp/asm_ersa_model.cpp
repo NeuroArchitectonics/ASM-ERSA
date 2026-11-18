@@ -970,7 +970,7 @@ void Impl::append_ersa_step(LayerDev& L, uint32_t t, std::vector<算子步骤>& 
     const uint32_t N = t + 1;
     const uint32_t NB = (N + cfg.block_size - 1) / cfg.block_size;
     const ErsaStepPC pc{1, H, Tmax, N, DK, DV, NB, cfg.block_size,
-                        cfg.top_blocks, cfg.window, t, NBmax, 1.0f, L.ersa_dev.sink};
+                        cfg.top_blocks, cfg.window, t, NBmax, 0.005f, L.ersa_dev.sink};
     append_step(steps, "ersa_attn_step",
                 {L.ersa_dev.q_hist.取句柄(), L.ersa_dev.k_hist.取句柄(),
                  L.ersa_dev.v_hist.取句柄(), L.ersa_dev.block_sum.取句柄(),
