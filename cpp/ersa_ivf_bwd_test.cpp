@@ -5,6 +5,8 @@
 #include "vk张量.hpp"
 #include "cpp/spv/ersa_attn_bwd_query.spv.hpp"
 #include "cpp/spv/ersa_ivf_attn_bwd_query.spv.hpp"
+#include "cpp/spv/ersa_ivf_attn_fused.spv.hpp"
+#include "cpp/spv/ersa_ivf_attn_query.spv.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -197,6 +199,87 @@ int main(int argc, char** argv) {
                     cse, use_window ? "topB+window" : "topB only",
                     edq, edk, edv, eds);
         ok = ok && edq <= 1e-6f && edk <= 1e-6f && edv <= 1e-6f && eds <= 1e-6f;
+    }
+
+    // QIDX/cache-query check: single query at row 3 must match the fused
+    // kernel and the T=1 backward after the same candidate set is selected.
+    {
+        const std::uint32_t QT = 4, QI = 3, QP = N - 1, QW = 8, QTOPB = 1;
+        std::vector<float> qh(H * QT * DK, 0.0f);
+        for (std::uint32_t h = 0; h < H; ++h)
+            for (std::uint32_t d = 0; d < DK; ++d)
+                qh[(h * QT + QI) * DK + d] = q[h * DK + d];
+        for (std::uint32_t h = 0; h < H; ++h) {
+            for (std::uint32_t d = 0; d < DK; ++d) {
+                cent[(h * C + 0) * DK + d] = q[h * DK + d];
+                cent[(h * C + 1) * DK + d] = -q[h * DK + d];
+            }
+        }
+        ctd.上传(cent.data(), cent.size() * 4);
+        vk张量 qht = mk({H, QT, DK}, 张量类型::浮点32, "qidx.qhist");
+        vk张量 of = mk({H, N, DV}, 张量类型::浮点32, "qidx.of");
+        vk张量 oq = mk({H, DV}, 张量类型::浮点32, "qidx.oq");
+        vk张量 dq4 = mk({H, QT, DK}, 张量类型::浮点32, "qidx.dq4");
+        vk张量 dk4 = mk({H, N, DK}, 张量类型::浮点32, "qidx.dk4");
+        vk张量 dv4 = mk({H, N, DV}, 张量类型::浮点32, "qidx.dv4");
+        vk张量 ds4 = mk({H}, 张量类型::浮点32, "qidx.ds4");
+        vk张量 dq1 = mk({H, 1, DK}, 张量类型::浮点32, "qidx.dq1");
+        vk张量 dk1 = mk({H, N, DK}, 张量类型::浮点32, "qidx.dk1");
+        vk张量 dv1 = mk({H, N, DV}, 张量类型::浮点32, "qidx.dv1");
+        vk张量 ds1 = mk({H}, 张量类型::浮点32, "qidx.ds1");
+        qht.上传(qh.data(), qh.size() * 4);
+        fill0(of); fill0(oq); fill0(dq4); fill0(dk4); fill0(dv4); fill0(ds4);
+        fill0(dq1); fill0(dk1); fill0(dv1); fill0(ds1);
+
+        const IvfBwdPC fp{1, H, N, N, DK, DV, C, LMAX, QTOPB, QW, 0, 0, tau, sink};
+        run("ersa_ivf_attn_fused",
+            {qb.取句柄(), kd.取句柄(), vd.取句柄(), ctd.取句柄(),
+             mid.取句柄(), cnd.取句柄(), of.取句柄()},
+            &fp, sizeof(fp), N, H, 1);
+        const IvfBwdPC qp{1, H, QT, N, DK, DV, C, LMAX, QTOPB, QW, QP, QI, tau, sink};
+        run("ersa_ivf_attn_query",
+            {qht.取句柄(), kd.取句柄(), vd.取句柄(), ctd.取句柄(),
+             mid.取句柄(), cnd.取句柄(), oq.取句柄()},
+            &qp, sizeof(qp), 1, H, 1);
+        run("ersa_ivf_attn_bwd_query",
+            {qht.取句柄(), kd.取句柄(), vd.取句柄(), ctd.取句柄(),
+             mid.取句柄(), cnd.取句柄(), dyi.取句柄(), dq4.取句柄(),
+             dk4.取句柄(), dv4.取句柄(), ds4.取句柄()},
+            &qp, sizeof(qp), 1, H, 1);
+        const IvfBwdPC op{1, H, 1, N, DK, DV, C, LMAX, QTOPB, QW, QP, 0, tau, sink};
+        run("ersa_ivf_attn_bwd_query",
+            {qi.取句柄(), kd.取句柄(), vd.取句柄(), ctd.取句柄(),
+             mid.取句柄(), cnd.取句柄(), dyi.取句柄(), dq1.取句柄(),
+             dk1.取句柄(), dv1.取句柄(), ds1.取句柄()},
+            &op, sizeof(op), 1, H, 1);
+
+        std::vector<float> hof(H * N * DV), hoq(H * DV);
+        std::vector<float> hdq4(H * QT * DK), hdq1(H * DK);
+        std::vector<float> hdk4(H * N * DK), hdk1(H * N * DK);
+        std::vector<float> hdv4(H * N * DV), hdv1(H * N * DV);
+        std::vector<float> hds4(H), hds1(H);
+        of.下载(hof.data(), hof.size() * 4); oq.下载(hoq.data(), hoq.size() * 4);
+        dq4.下载(hdq4.data(), hdq4.size() * 4); dq1.下载(hdq1.data(), hdq1.size() * 4);
+        dk4.下载(hdk4.data(), hdk4.size() * 4); dk1.下载(hdk1.data(), hdk1.size() * 4);
+        dv4.下载(hdv4.data(), hdv4.size() * 4); dv1.下载(hdv1.data(), hdv1.size() * 4);
+        ds4.下载(hds4.data(), hds4.size() * 4); ds1.下载(hds1.data(), hds1.size() * 4);
+
+        std::vector<float> ofrow(H * DV), dqrow(H * DK);
+        for (std::uint32_t h = 0; h < H; ++h) {
+            for (std::uint32_t d = 0; d < DV; ++d)
+                ofrow[h * DV + d] = hof[(h * N + QP) * DV + d];
+            for (std::uint32_t d = 0; d < DK; ++d)
+                dqrow[h * DK + d] = hdq4[(h * QT + QI) * DK + d];
+        }
+        const float ef = max_abs(ofrow, hoq);
+        const float eq = max_abs(dqrow, hdq1);
+        const float ek = max_abs(hdk4, hdk1);
+        const float ev = max_abs(hdv4, hdv1);
+        const float es = max_abs(hds4, hds1);
+        std::printf("qidx: fwd %.3g dQ %.3g dK %.3g dV %.3g dsink %.3g\n",
+                    ef, eq, ek, ev, es);
+        ok = ok && ef <= 1e-6f && eq <= 1e-6f && ek <= 1e-6f &&
+             ev <= 1e-6f && es <= 1e-6f;
     }
 
     if (argc >= 3 && std::string(argv[2]) == "bench") {

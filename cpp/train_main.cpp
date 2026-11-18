@@ -39,6 +39,13 @@
 #include "cpp/spv/l2norm_bwd.spv.hpp"
 #include "cpp/spv/asm_step_bwd_multi.spv.hpp"
 #include "cpp/spv/ersa_attn_bwd_query.spv.hpp"
+#include "cpp/spv/ersa_ivf_attn_query.spv.hpp"
+#include "cpp/spv/ersa_ivf_attn_bwd_query.spv.hpp"
+#include "cpp/spv/ivf_init_centroids.spv.hpp"
+#include "cpp/spv/kmeans_assign.spv.hpp"
+#include "cpp/spv/kmeans_update.spv.hpp"
+#include "cpp/spv/kmeans_fill_members.spv.hpp"
+#include "cpp/spv/copy_f32_slice.spv.hpp"
 #include "cpp/spv/add_inplace.spv.hpp"
 #include "cpp/spv/dequant_i8.spv.hpp"
 #include "cpp/spv/quantize_rows_i8.spv.hpp"
@@ -105,6 +112,23 @@ struct ErsaBwdPC {
     std::uint32_t B, H, T, N, DK, DV, NB, BLOCK, TOPB, WINDOW, QOFF, NBMAX;
     float tau, sink, pad0, pad1;
 };
+struct IvfPc {
+    std::uint32_t B, H, T, N, DK, DV, C, LMAX, TOPB, WINDOW, QPOS, QIDX;
+    float tau, sink;
+};
+static_assert(sizeof(IvfPc) == 56, "IvfPc must be 56 bytes");
+struct IvfInitPC {
+    std::uint32_t H, N, DK, C, pad0, pad1, pad2, pad3;
+};
+struct KMeansPC {
+    std::uint32_t B, H, N, DK, C, pad0, pad1, pad2;
+};
+struct FillMemberPC {
+    std::uint32_t B, H, N, C, LMAX, pad0, pad1, pad2;
+};
+struct CopySlicePC {
+    std::uint32_t H, SRC_N, DST_N, D, ROWS, SRC_ROW0, DST_ROW0, pad0;
+};
 struct Gr2BwdPC { std::uint32_t B, D, write_out, pad0; };
 struct L2BwdPC { std::uint32_t N, D, norm_offset, norm_stride; };
 struct TransposePC { std::uint32_t R, C, pad0, pad1; };
@@ -162,6 +186,8 @@ struct 层 {
     参数 *betaNull = nullptr, *sink = nullptr;
     参数 *gate = nullptr, *W1 = nullptr, *W2 = nullptr, *shW1 = nullptr, *shWup = nullptr, *shW2 = nullptr;
     vk张量 K, V, beta, q_hist, k_hist, v_hist, block_sum, qkv_norm;
+    vk张量 q_ctx, k_cache, v_cache, block_cache, ctx_k;
+    vk张量 cent, counts, member, assign;
     vk张量 moe_W1_i8, moe_W1_s, moe_W2_i8, moe_W2_s;
     vk张量 W1f_deq, W1m_deq, W2f_deq, W2m_deq;
     vk张量 shW1_deq, shWup_deq, shW2_deq, shW1T_deq, shWupT_deq, shW2T_deq;
@@ -201,7 +227,22 @@ int main(int argc, char** argv) {
     cfg.moe_top_k = 2;
     cfg.max_seq_len = 16;
 
+    // cache0：无 context、window-only 候选，用于 block/cache 两条路径对拍。
+    const bool parity_mode = (模式 == "cache0" || 模式 == "cache0_smoke");
+    const bool cache_mode = (模式 == "cache" || 模式 == "cache_smoke" || parity_mode);
     const std::uint32_t T = 4;
+    const std::uint32_t Nctx = (cache_mode && !parity_mode) ? 8u : 0u;
+    const std::uint32_t Ntot = cache_mode ? Nctx + T : 0u;
+    const std::uint32_t IVFC = cache_mode
+        ? std::max<std::uint32_t>(1u, std::min<std::uint32_t>(64u, Nctx)) : 0u;
+    const std::uint32_t IVFLMAX = cache_mode
+        ? std::min<std::uint32_t>(1024u, std::max<std::uint32_t>(32u, Nctx + T)) : 0u;
+    const std::uint32_t NBtot = cache_mode
+        ? (Ntot + cfg.block_size - 1) / cfg.block_size : 0u;
+    // parity 只保留 window 候选，用同一候选集对拍 block/cache 两条路径。
+    if (parity_mode) cfg.top_blocks = 0;
+    const std::uint32_t IVFWIN = cfg.window;
+    bool bwd_cache = cache_mode;
     const std::uint32_t B = 1;
     const std::uint32_t D = cfg.d_model, H = cfg.n_heads, DK = cfg.d_k, DV = cfg.d_v;
     const std::uint32_t F = cfg.d_ff, E = cfg.n_experts, V = cfg.vocab_size;
@@ -223,6 +264,9 @@ int main(int argc, char** argv) {
     std::printf("设备: %s | 算子: %zu\n", 调度器.获取设备().名称(), 调度器.算子数量());
     for (const char* 名 : {"gr_read_bwd_int8", "gr_route_bwd_int8", "gr2_write_bwd",
                            "l2norm_bwd", "asm_step_bwd_multi", "ersa_attn_bwd_query",
+                           "ersa_ivf_attn_query", "ersa_ivf_attn_bwd_query",
+                           "ivf_init_centroids", "kmeans_assign", "kmeans_update",
+                           "kmeans_fill_members", "copy_f32_slice",
                            "linear_bwd_dx", "linear_bwd_dwdb", "moe_bwd_dx_q",
                            "moe_bwd_dw_expert_q", "moe_bwd_dw_shared_q", "adamw_update"}) {
         if (!调度器.存在算子(名)) {
@@ -444,6 +488,27 @@ int main(int argc, char** argv) {
             L.k_hist = 建({H, T, DK}, 张量类型::浮点32, "ersa.k_hist");
             L.v_hist = 建({H, T, DV}, 张量类型::浮点32, "ersa.v_hist");
             L.block_sum = 建({H, NBmaxT, DK}, 张量类型::浮点32, "ersa.block_sum");
+            if (cache_mode) {
+                const std::string p = "L" + std::to_string(li) + ".cache";
+                L.k_cache = 建({H, Ntot, DK}, 张量类型::浮点32, p + ".k");
+                L.v_cache = 建({H, Ntot, DV}, 张量类型::浮点32, p + ".v");
+                L.block_cache = 建({H, NBtot, DK}, 张量类型::浮点32, p + ".bs");
+                L.cent = 建({H, IVFC, DK}, 张量类型::浮点32, p + ".cent");
+                L.counts = 建({H, IVFC}, 张量类型::整数32, p + ".counts");
+                L.member = 建({H, IVFC, IVFLMAX}, 张量类型::整数32, p + ".member");
+                if (Nctx > 0) {
+                    L.q_ctx = 建({H, Ntot, DK}, 张量类型::浮点32, p + ".qctx");
+                    L.ctx_k = 建({H, Nctx, DK}, 张量类型::浮点32, p + ".ctxk");
+                    L.assign = 建({H, Nctx}, 张量类型::整数32, p + ".assign");
+                } else {
+                    std::vector<float> zc(std::size_t(H) * IVFC * DK, 0.0f);
+                    std::vector<std::int32_t> zi(std::size_t(H) * IVFC, 0);
+                    std::vector<std::int32_t> zm(std::size_t(H) * IVFC * IVFLMAX, 0);
+                    L.cent.上传(zc.data(), zc.size() * 4);
+                    L.counts.上传(zi.data(), zi.size() * 4);
+                    L.member.上传(zm.data(), zm.size() * 4);
+                }
+            }
         } else {
             L.K = 建({B, H, M, DK}, 张量类型::浮点32, "asm.K");
             L.V = 建({B, H, M, DV}, 张量类型::浮点32, "asm.V");
@@ -481,6 +546,13 @@ int main(int argc, char** argv) {
     vk张量 block_dummy = 建({1}, 张量类型::浮点32, "block_dummy");
     vk张量 eta_w_dummy = 建零(D, "eta_w_dummy");
     vk张量 eta_b_dummy = 建零(1, "eta_b_dummy");
+    vk张量 ctx_qkv_norm;
+    vk张量 dkqCache, dvqCache;
+    if (cache_mode) {
+        ctx_qkv_norm = 建({2, H, Ntot}, 张量类型::浮点32, "cache.ctx_qkv_norm");
+        dkqCache = 建({H, Ntot, DK}, 张量类型::浮点32, "cache.dkq");
+        dvqCache = 建({H, Ntot, DV}, 张量类型::浮点32, "cache.dvq");
+    }
 
     std::vector<std::int32_t> idh(T), th(T);
     for (std::uint32_t t = 0; t < T; ++t) {
@@ -782,6 +854,7 @@ int main(int argc, char** argv) {
             }
         } else {
             填零(dQH); 填零(dKH); 填零(dVH); 填零(dSinkH);
+            if (bwd_cache) { 填零(dkqCache); 填零(dvqCache); }
         }
         填零(dEtaH);
 
@@ -974,17 +1047,40 @@ int main(int argc, char** argv) {
 
         if (L.ersa) {
             // 先完成所有 query 的 dK/dV/dsink 累加，再统一做 QKV/GR read 反向。
-            for (std::uint32_t t = 0; t < T; ++t) {
-                const std::uint32_t N = t + 1;
-                const std::uint32_t NB = (N + cfg.block_size - 1) / cfg.block_size;
-                const ErsaBwdPC ep{1, H, T, N, DK, DV, NB, cfg.block_size,
-                                   cfg.top_blocks, cfg.window, t, NBmaxT, 0.005f,
-                                   L.sink_value, 0.0f, 0.0f};
-                提交2("ersa_attn_bwd_query",
-                      {L.q_hist.取句柄(), L.k_hist.取句柄(), L.v_hist.取句柄(),
-                       L.block_sum.取句柄(), dOrec[t].取句柄(), dQH.取句柄(),
-                       dKH.取句柄(), dVH.取句柄(), dSinkH.取句柄()},
-                      &ep, sizeof(ep), H, 1, 1);
+            if (bwd_cache) {
+                // 训练时索引在 prefill 后冻结；前向和反向都读同一份
+                // centroid/member，候选集严格一致。context 的 dK/dV 不向
+                // prefill 截断传播，只提取 query 行进入 QKV 反向。
+                for (std::uint32_t t = 0; t < T; ++t) {
+                    const IvfPc bp{B, H, T, Ntot, DK, DV, IVFC, IVFLMAX,
+                                   cfg.top_blocks, IVFWIN, Nctx + t, t,
+                                   0.005f, L.sink_value};
+                    提交2("ersa_ivf_attn_bwd_query",
+                          {L.q_hist.取句柄(), L.k_cache.取句柄(), L.v_cache.取句柄(),
+                           L.cent.取句柄(), L.member.取句柄(), L.counts.取句柄(),
+                           dOrec[t].取句柄(), dQH.取句柄(), dkqCache.取句柄(),
+                           dvqCache.取句柄(), dSinkH.取句柄()},
+                          &bp, sizeof(bp), 1, H, 1);
+                }
+                const CopySlicePC ck{H, Ntot, T, DK, T, Nctx, 0, 0};
+                const CopySlicePC cv{H, Ntot, T, DV, T, Nctx, 0, 0};
+                提交2("copy_f32_slice",
+                      {dkqCache.取句柄(), dKH.取句柄()}, &ck, sizeof(ck), T, H, 1);
+                提交2("copy_f32_slice",
+                      {dvqCache.取句柄(), dVH.取句柄()}, &cv, sizeof(cv), T, H, 1);
+            } else {
+                for (std::uint32_t t = 0; t < T; ++t) {
+                    const std::uint32_t N = t + 1;
+                    const std::uint32_t NB = (N + cfg.block_size - 1) / cfg.block_size;
+                    const ErsaBwdPC ep{1, H, T, N, DK, DV, NB, cfg.block_size,
+                                       cfg.top_blocks, cfg.window, t, NBmaxT, 0.005f,
+                                       L.sink_value, 0.0f, 0.0f};
+                    提交2("ersa_attn_bwd_query",
+                          {L.q_hist.取句柄(), L.k_hist.取句柄(), L.v_hist.取句柄(),
+                           L.block_sum.取句柄(), dOrec[t].取句柄(), dQH.取句柄(),
+                           dKH.取句柄(), dVH.取句柄(), dSinkH.取句柄()},
+                          &ep, sizeof(ep), H, 1, 1);
+                }
             }
 
             const L2BwdPC l2q{H * T, DK, 0, 1};
@@ -1305,9 +1401,370 @@ int main(int argc, char** argv) {
               &lh, sizeof(lh), (V + 63) / 64, T, 1);
     };
 
+    auto 缓存前向 = [&]() {
+        std::vector<std::int32_t> ctxIds(Nctx);
+        for (std::uint32_t i = 0; i < Nctx; ++i)
+            ctxIds[i] = int((i * 5u + 1u) % V);
+        if (Nctx > 0) ids.上传(ctxIds.data(), ctxIds.size() * 4);
+        重置ASM();
+
+        for (std::uint32_t ct = 0; ct < Nctx; ++ct) {
+            for (std::uint32_t li = 0; li < cfg.n_layers; ++li) {
+                层& L = 层表[li];
+                const bool first = (li == 0);
+                const GRReadPC gr{B, D, Nctx, ct, first ? 1u : 0u, H, 0, 0};
+                const vk张量& eww = L.ersa ? eta_w_dummy : L.etaW->p;
+                const vk张量& ebb = L.ersa ? eta_b_dummy : L.etaB->p;
+                提交2("gr_read_quant_int8",
+                      {embed->i8.取句柄(), embed->s.取句柄(), ids.取句柄(), branches.取句柄(),
+                       L.g1ng->p.取句柄(), L.g1rw->p.取句柄(), L.g1rb->p.取句柄(),
+                       eww.取句柄(), ebb.取句柄(), xq.取句柄(), sx.取句柄(), eta.取句柄()},
+                      &gr, sizeof(gr), 1, 1, 1);
+
+                if (!L.ersa) {
+                    const QkvGemvPC pq{1, D, H, DK, DV, Ntot, ct, 0, 0, NBtot, cfg.block_size, 0};
+                    const QkvGemvPC pk{1, D, H, DK, DV, Ntot, ct, 1, 0, NBtot, cfg.block_size, 0};
+                    const QkvGemvPC pv{1, D, H, DK, DV, Ntot, ct, 2, 0, NBtot, cfg.block_size, 0};
+                    提交2("qkv_gemv_int8",
+                          {xq.取句柄(), sx.取句柄(), L.Wq->i8.取句柄(), L.Wq->s.取句柄(),
+                           qkv_q.取句柄(), block_dummy.取句柄(), ctx_qkv_norm.取句柄()},
+                          &pq, sizeof(pq), H, 1, 1);
+                    提交2("qkv_gemv_int8",
+                          {xq.取句柄(), sx.取句柄(), L.Wk->i8.取句柄(), L.Wk->s.取句柄(),
+                           qkv_k.取句柄(), block_dummy.取句柄(), ctx_qkv_norm.取句柄()},
+                          &pk, sizeof(pk), H, 1, 1);
+                    提交2("qkv_gemv_int8",
+                          {xq.取句柄(), sx.取句柄(), L.Wv->i8.取句柄(), L.Wv->s.取句柄(),
+                           qkv_v.取句柄(), block_dummy.取句柄(), ctx_qkv_norm.取句柄()},
+                          &pv, sizeof(pv), H, 1, 1);
+                    const AsmStepPC ap{B, H, M, DK, DV, R, 0, 0,
+                                       0.005f, 0.005f, 0.9f, 0.01f, L.beta_null, 0.0f};
+                    提交2("asm_step_eta",
+                          {qkv_q.取句柄(), qkv_k.取句柄(), qkv_v.取句柄(),
+                           L.K.取句柄(), L.V.取句柄(), L.beta.取句柄(), L.gamma->p.取句柄(),
+                           o.取句柄(), eta.取句柄(), dbg.取句柄()},
+                          &ap, sizeof(ap), H, 1, 1);
+                } else {
+                    const QkvGemvPC pq{1, D, H, DK, DV, Ntot, ct, 0, 1, NBtot, cfg.block_size, 0};
+                    const QkvGemvPC pk{1, D, H, DK, DV, Ntot, ct, 1, 1, NBtot, cfg.block_size, 0};
+                    const QkvGemvPC pv{1, D, H, DK, DV, Ntot, ct, 2, 1, NBtot, cfg.block_size, 0};
+                    提交2("qkv_gemv_int8",
+                          {xq.取句柄(), sx.取句柄(), L.Wq->i8.取句柄(), L.Wq->s.取句柄(),
+                           L.q_ctx.取句柄(), block_dummy.取句柄(), ctx_qkv_norm.取句柄()},
+                          &pq, sizeof(pq), H, 1, 1);
+                    提交2("qkv_gemv_int8",
+                          {xq.取句柄(), sx.取句柄(), L.Wk->i8.取句柄(), L.Wk->s.取句柄(),
+                           L.k_cache.取句柄(), L.block_cache.取句柄(), ctx_qkv_norm.取句柄()},
+                          &pk, sizeof(pk), H, 1, 1);
+                    提交2("qkv_gemv_int8",
+                          {xq.取句柄(), sx.取句柄(), L.Wv->i8.取句柄(), L.Wv->s.取句柄(),
+                           L.v_cache.取句柄(), block_dummy.取句柄(), ctx_qkv_norm.取句柄()},
+                          &pv, sizeof(pv), H, 1, 1);
+                    const std::uint32_t N = ct + 1;
+                    const std::uint32_t NB = (N + cfg.block_size - 1) / cfg.block_size;
+                    const ErsaStepPC ep{B, H, Ntot, N, DK, DV, NB, cfg.block_size,
+                                        cfg.top_blocks, cfg.window, ct, NBtot, 0.005f,
+                                        L.sink_value};
+                    提交2("ersa_attn_step",
+                          {L.q_ctx.取句柄(), L.k_cache.取句柄(), L.v_cache.取句柄(),
+                           L.block_cache.取句柄(), attn_out.取句柄()},
+                          &ep, sizeof(ep), H, 1, 1);
+                }
+
+                const WoTilePC wp{1, D, HDV, 64, 0, 0, 0, 0};
+                const vk张量& oi = L.ersa ? attn_out : o;
+                提交2("wo_gemv_int8",
+                      {oi.取句柄(), L.Wo->i8.取句柄(), L.Wo->s.取句柄(),
+                       wo_y.取句柄(), wo_deq.取句柄()},
+                      &wp, sizeof(wp), (D + 63) / 64, 1, 1);
+                const WoRoutePC np{1, D, HDV, E, K, 0, 0, 0};
+                提交2("norm_gr_route_int8",
+                      {wo_y.取句柄(), L.outNorm->p.取句柄(), branches.取句柄(),
+                       L.g1ww->p.取句柄(), L.g1wb->p.取句柄(),
+                       L.g2ng->p.取句柄(), L.g2rw->p.取句柄(), L.g2rb->p.取句柄(),
+                       L.gate->p.取句柄(), x2.取句柄(), moe_idx.取句柄(), moe_w.取句柄()},
+                      &np, sizeof(np), 1, 1, 1);
+                const MoeExpertsPC hp{1, D, F, E, K, 128, 0, 0};
+                const std::uint32_t fg = (F + 127) / 128;
+                提交2("moe_h_gemv_int8",
+                      {x2.取句柄(), L.moe_W1_i8.取句柄(), L.moe_W1_s.取句柄(),
+                       moe_idx.取句柄(), h_q.取句柄(), h_s.取句柄()},
+                      &hp, sizeof(hp), K, fg, 1);
+                const MoeExpertsPC op{1, D, F, E, K, 64, 0, 0};
+                const std::uint32_t dt = (D + 63) / 64;
+                提交2("moe_out_gemv_int8",
+                      {h_q.取句柄(), h_s.取句柄(), L.moe_W2_i8.取句柄(), L.moe_W2_s.取句柄(),
+                       moe_idx.取句柄(), moe_w.取句柄(), expert_out.取句柄()},
+                      &op, sizeof(op), K, dt, 1);
+                const MoeReducePC rp{1, D, F, K, 1024, ct, Nctx, 0};
+                提交2("moe_reduce_grwrite_int8",
+                      {x2.取句柄(), L.shW1->i8.取句柄(), L.shW1->s.取句柄(),
+                       L.shWup->i8.取句柄(), L.shWup->s.取句柄(),
+                       L.shW2->i8.取句柄(), L.shW2->s.取句柄(),
+                       expert_out.取句柄(), branches.取句柄(),
+                       L.g2ww->p.取句柄(), L.g2wb->p.取句柄(), out_tokens.取句柄(),
+                       y_moe.取句柄()},
+                      &rp, sizeof(rp), 1, 1, 1);
+            }
+        }
+
+        for (std::uint32_t li = 0; li < cfg.n_layers; ++li) {
+            层& L = 层表[li];
+            if (!L.ersa || Nctx == 0u) continue;
+            const CopySlicePC cp{H, Ntot, Nctx, DK, Nctx, 0, 0, 0};
+            提交2("copy_f32_slice",
+                  {L.k_cache.取句柄(), L.ctx_k.取句柄()}, &cp, sizeof(cp), Nctx, H, 1);
+            const IvfInitPC ip{H, Nctx, DK, IVFC, 0, 0, 0, 0};
+            提交2("ivf_init_centroids",
+                  {L.ctx_k.取句柄(), L.cent.取句柄()}, &ip, sizeof(ip), IVFC, H, 1);
+            const KMeansPC kp{1, H, Nctx, DK, IVFC, 0, 0, 0};
+            for (int it = 0; it < 10; ++it) {
+                提交2("kmeans_assign",
+                      {L.ctx_k.取句柄(), L.cent.取句柄(), L.assign.取句柄()},
+                      &kp, sizeof(kp), Nctx, H, 1);
+                提交2("kmeans_update",
+                      {L.ctx_k.取句柄(), L.assign.取句柄(), L.cent.取句柄(),
+                       L.counts.取句柄()},
+                      &kp, sizeof(kp), IVFC, H, 1);
+            }
+            const FillMemberPC fp{1, H, Nctx, IVFC, IVFLMAX, 0, 0, 0};
+            提交2("kmeans_fill_members",
+                  {L.assign.取句柄(), L.member.取句柄()}, &fp, sizeof(fp), IVFC, H, 1);
+        }
+
+        ids.上传(idh.data(), idh.size() * 4);
+        for (std::uint32_t t = 0; t < T; ++t) {
+            for (std::uint32_t li = 0; li < cfg.n_layers; ++li) {
+                层& L = 层表[li];
+                记录& rec = *记录表[t][li];
+                const bool first = (li == 0);
+                const GRReadPC gr{B, D, T, t, first ? 1u : 0u, H, 0, 0};
+                const vk张量& eww = L.ersa ? eta_w_dummy : L.etaW->p;
+                const vk张量& ebb = L.ersa ? eta_b_dummy : L.etaB->p;
+                提交2("gr_read_quant_int8",
+                      {embed->i8.取句柄(), embed->s.取句柄(), ids.取句柄(), branches.取句柄(),
+                       L.g1ng->p.取句柄(), L.g1rw->p.取句柄(), L.g1rb->p.取句柄(),
+                       eww.取句柄(), ebb.取句柄(), xq.取句柄(), sx.取句柄(), eta.取句柄()},
+                      &gr, sizeof(gr), 1, 1, 1);
+                xq.拷贝到(rec.xq);
+                sx.拷贝到(rec.sx);
+                eta.拷贝到(rec.eta);
+                branches.拷贝到(rec.branch_in);
+
+                if (!L.ersa) {
+                    L.K.拷贝到(rec.Kold);
+                    L.V.拷贝到(rec.Vold);
+                    L.beta.拷贝到(rec.Bold);
+                    const QkvGemvPC pq{1, D, H, DK, DV, T, t, 0, 0, NBmaxT, cfg.block_size, 0};
+                    const QkvGemvPC pk{1, D, H, DK, DV, T, t, 1, 0, NBmaxT, cfg.block_size, 0};
+                    const QkvGemvPC pv{1, D, H, DK, DV, T, t, 2, 0, NBmaxT, cfg.block_size, 0};
+                    提交2("qkv_gemv_int8",
+                          {xq.取句柄(), sx.取句柄(), L.Wq->i8.取句柄(), L.Wq->s.取句柄(),
+                           qkv_q.取句柄(), block_dummy.取句柄(), L.qkv_norm.取句柄()},
+                          &pq, sizeof(pq), H, 1, 1);
+                    提交2("qkv_gemv_int8",
+                          {xq.取句柄(), sx.取句柄(), L.Wk->i8.取句柄(), L.Wk->s.取句柄(),
+                           qkv_k.取句柄(), block_dummy.取句柄(), L.qkv_norm.取句柄()},
+                          &pk, sizeof(pk), H, 1, 1);
+                    提交2("qkv_gemv_int8",
+                          {xq.取句柄(), sx.取句柄(), L.Wv->i8.取句柄(), L.Wv->s.取句柄(),
+                           qkv_v.取句柄(), block_dummy.取句柄(), L.qkv_norm.取句柄()},
+                          &pv, sizeof(pv), H, 1, 1);
+                    qkv_q.拷贝到(rec.qkv_q);
+                    qkv_k.拷贝到(rec.qkv_k);
+                    qkv_v.拷贝到(rec.qkv_v);
+                    const AsmStepPC ap{B, H, M, DK, DV, R, 0, 0,
+                                       0.005f, 0.005f, 0.9f, 0.01f, L.beta_null, 0.0f};
+                    提交2("asm_step_eta",
+                          {qkv_q.取句柄(), qkv_k.取句柄(), qkv_v.取句柄(),
+                           L.K.取句柄(), L.V.取句柄(), L.beta.取句柄(), L.gamma->p.取句柄(),
+                           o.取句柄(), eta.取句柄(), dbg.取句柄()},
+                          &ap, sizeof(ap), H, 1, 1);
+                    dbg.拷贝到(rec.dbg);
+                } else {
+                    const std::uint32_t pos = Nctx + t;
+                    const QkvGemvPC pq{1, D, H, DK, DV, T, t, 0, 1,
+                                       NBmaxT, cfg.block_size, 0};
+                    const QkvGemvPC pk{1, D, H, DK, DV, Ntot, pos, 1, 1,
+                                       NBtot, cfg.block_size, 0};
+                    const QkvGemvPC pv{1, D, H, DK, DV, Ntot, pos, 2, 1,
+                                       NBtot, cfg.block_size, 0};
+                    提交2("qkv_gemv_int8",
+                          {xq.取句柄(), sx.取句柄(), L.Wq->i8.取句柄(), L.Wq->s.取句柄(),
+                           L.q_hist.取句柄(), block_dummy.取句柄(), L.qkv_norm.取句柄()},
+                          &pq, sizeof(pq), H, 1, 1);
+                    提交2("qkv_gemv_int8",
+                          {xq.取句柄(), sx.取句柄(), L.Wk->i8.取句柄(), L.Wk->s.取句柄(),
+                           L.k_cache.取句柄(), L.block_cache.取句柄(), L.qkv_norm.取句柄()},
+                          &pk, sizeof(pk), H, 1, 1);
+                    提交2("qkv_gemv_int8",
+                          {xq.取句柄(), sx.取句柄(), L.Wv->i8.取句柄(), L.Wv->s.取句柄(),
+                           L.v_cache.取句柄(), block_dummy.取句柄(), L.qkv_norm.取句柄()},
+                          &pv, sizeof(pv), H, 1, 1);
+                    const IvfPc qp{B, H, T, Ntot, DK, DV, IVFC, IVFLMAX,
+                                   cfg.top_blocks, cfg.window, pos, t,
+                                   0.005f, L.sink_value};
+                    提交2("ersa_ivf_attn_query",
+                          {L.q_hist.取句柄(), L.k_cache.取句柄(), L.v_cache.取句柄(),
+                           L.cent.取句柄(), L.member.取句柄(), L.counts.取句柄(),
+                           attn_out.取句柄()},
+                          &qp, sizeof(qp), 1, H, 1);
+                }
+                const vk张量& attn_src = L.ersa ? attn_out : o;
+                attn_src.拷贝到(rec.o);
+
+                const WoTilePC wp{1, D, HDV, 64, 0, 0, 0, 0};
+                const vk张量& oi = L.ersa ? attn_out : o;
+                提交2("wo_gemv_int8",
+                      {oi.取句柄(), L.Wo->i8.取句柄(), L.Wo->s.取句柄(),
+                       wo_y.取句柄(), wo_deq.取句柄()},
+                      &wp, sizeof(wp), (D + 63) / 64, 1, 1);
+                wo_y.拷贝到(rec.wo_y);
+                wo_deq.拷贝到(rec.o_deq);
+
+                const WoRoutePC np{1, D, HDV, E, K, 0, 0, 0};
+                提交2("norm_gr_route_int8",
+                      {wo_y.取句柄(), L.outNorm->p.取句柄(), branches.取句柄(),
+                       L.g1ww->p.取句柄(), L.g1wb->p.取句柄(),
+                       L.g2ng->p.取句柄(), L.g2rw->p.取句柄(), L.g2rb->p.取句柄(),
+                       L.gate->p.取句柄(), x2.取句柄(), moe_idx.取句柄(), moe_w.取句柄()},
+                      &np, sizeof(np), 1, 1, 1);
+                branches.拷贝到(rec.branch_mid);
+                x2.拷贝到(rec.x2);
+                {
+                    const QuantPC qx{1, D, 0, 0};
+                    提交2("quantize_dequant_f32", {x2.取句柄(), rec.x2_deq.取句柄()},
+                          &qx, sizeof(qx), 1, 1, 1);
+                }
+                moe_idx.拷贝到(rec.idx);
+                moe_w.拷贝到(rec.w);
+
+                const MoeExpertsPC hp{1, D, F, E, K, 128, 0, 0};
+                const std::uint32_t fg = (F + 127) / 128;
+                提交2("moe_h_gemv_int8",
+                      {x2.取句柄(), L.moe_W1_i8.取句柄(), L.moe_W1_s.取句柄(),
+                       moe_idx.取句柄(), h_q.取句柄(), h_s.取句柄()},
+                      &hp, sizeof(hp), K, fg, 1);
+                const MoeExpertsPC op{1, D, F, E, K, 64, 0, 0};
+                const std::uint32_t dt = (D + 63) / 64;
+                提交2("moe_out_gemv_int8",
+                      {h_q.取句柄(), h_s.取句柄(), L.moe_W2_i8.取句柄(), L.moe_W2_s.取句柄(),
+                       moe_idx.取句柄(), moe_w.取句柄(), expert_out.取句柄()},
+                      &op, sizeof(op), K, dt, 1);
+                const MoeReducePC rp{1, D, F, K, 1024, t, T,
+                                     (li + 1 == cfg.n_layers) ? 1u : 0u};
+                提交2("moe_reduce_grwrite_int8",
+                      {x2.取句柄(), L.shW1->i8.取句柄(), L.shW1->s.取句柄(),
+                       L.shWup->i8.取句柄(), L.shWup->s.取句柄(),
+                       L.shW2->i8.取句柄(), L.shW2->s.取句柄(),
+                       expert_out.取句柄(), branches.取句柄(),
+                       L.g2ww->p.取句柄(), L.g2wb->p.取句柄(), out_tokens.取句柄(),
+                       y_moe.取句柄()},
+                      &rp, sizeof(rp), 1, 1, 1);
+                branches.拷贝到(rec.branch_out);
+                y_moe.拷贝到(rec.y_moe);
+            }
+        }
+
+        const RMSNormPC fn{T, D, 1e-6f, 0};
+        提交2("rmsnorm_quant",
+              {out_tokens.取句柄(), finalNorm->p.取句柄(), normed_q.取句柄(), normed_s.取句柄()},
+              &fn, sizeof(fn), T, 1, 1);
+        const LmHeadPC lh{T, D, V, 64, 0, 0, 0, 0};
+        提交2("lm_head_gemv_int8",
+              {normed_q.取句柄(), normed_s.取句柄(), lmhead->i8.取句柄(), lmhead->s.取句柄(),
+               logits.取句柄()},
+              &lh, sizeof(lh), (V + 63) / 64, T, 1);
+    };
+
     // 与主模型 INT8 前向做一次回归：训练器用自己的参数/缓冲，数值应一致。
     刷新全部Deq();
     刷新MoEDeq();
+    if (cache_mode) {
+        try {
+            auto 抓梯度 = [&]() {
+                std::vector<float> out;
+                for (auto& p : 全部参数) {
+                    std::vector<float> g(static_cast<std::size_t>(p->n));
+                    p->g.下载(g.data(), g.size() * 4);
+                    out.insert(out.end(), g.begin(), g.end());
+                }
+                return out;
+            };
+            std::vector<float> lblk;
+            if (parity_mode) {
+                前向();
+                lblk.resize(static_cast<std::size_t>(T) * V);
+                logits.下载(lblk.data(), lblk.size() * 4);
+            }
+            缓存前向();
+            std::vector<float> l1(static_cast<std::size_t>(T) * V);
+            logits.下载(l1.data(), l1.size() * 4);
+            缓存前向();
+            std::vector<float> l2(static_cast<std::size_t>(T) * V);
+            logits.下载(l2.data(), l2.size() * 4);
+            float fdiff = 0.0f;
+            size_t 非有限 = 0;
+            for (std::size_t i = 0; i < l1.size(); ++i) {
+                fdiff = std::max(fdiff, std::fabs(l1[i] - l2[i]));
+                if (!std::isfinite(l1[i])) ++非有限;
+            }
+            float pfdiff = 0.0f;
+            if (parity_mode) {
+                for (std::size_t i = 0; i < l2.size(); ++i)
+                    pfdiff = std::max(pfdiff, std::fabs(lblk[i] - l2[i]));
+            }
+
+            清零梯度();
+            bwd_cache = true;
+            const float loss = 反向全部();
+            const std::vector<float> g1 = 抓梯度();
+            size_t 非有限梯度 = 0;
+            double 最大梯度 = 0.0;
+            for (float x : g1) {
+                if (!std::isfinite(x)) ++非有限梯度;
+                else 最大梯度 = std::max(最大梯度, double(std::fabs(x)));
+            }
+            清零梯度();
+            bwd_cache = true;
+            反向全部();
+            const std::vector<float> g2 = 抓梯度();
+            double gdiff = 0.0;
+            for (std::size_t i = 0; i < g1.size() && i < g2.size(); ++i)
+                gdiff = std::max(gdiff, double(std::fabs(g1[i] - g2[i])));
+
+            double pgdiff = 0.0;
+            if (parity_mode) {
+                前向();
+                清零梯度();
+                bwd_cache = false;
+                反向全部();
+                const std::vector<float> gb = 抓梯度();
+                for (std::size_t i = 0; i < g1.size() && i < gb.size(); ++i)
+                    pgdiff = std::max(pgdiff, double(std::fabs(g1[i] - gb[i])));
+                bwd_cache = true;
+            }
+
+            std::printf("cache 反向 smoke: Nctx=%u T=%u | fwd diff %.3g | parity fwd %.3g | "
+                        "loss %.6f | 参数 %zu | 梯度元素 %zu | 非有限 %zu | max|g| %.6g | "
+                        "grad diff %.3g | parity grad %.3g\n",
+                        Nctx, T, fdiff, pfdiff, loss, 全部参数.size(), g1.size(),
+                        非有限梯度, 最大梯度, gdiff, pgdiff);
+            std::printf("  ||dEmbed||=%.6g ||dWq(L0)||=%.6g ||dWo(L0)||=%.6g ||dW1(L0)||=%.6g\n",
+                        范数(embed->g), 范数(层表[0].Wq->g), 范数(层表[0].Wo->g),
+                        范数(层表[0].W1->g));
+            const bool ok = (非有限 == 0 && 非有限梯度 == 0 && fdiff <= 1e-6f &&
+                             gdiff <= 1e-6 && (!parity_mode ||
+                             (pfdiff <= 1e-6f && pgdiff <= 1e-4)));
+            std::printf("%s\n", ok ? "CACHE PASS" : "CACHE FAIL");
+            调度器.停止();
+            return ok ? 0 : 1;
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "cache 反向失败: %s\n", e.what());
+            调度器.停止();
+            return 1;
+        }
+    }
     try {
         前向();
         std::vector<float> 训练logits(static_cast<std::size_t>(T) * V);
