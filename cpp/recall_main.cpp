@@ -101,7 +101,7 @@ int main(int argc, char** argv) {
         vd.上传(v.data(), v.size() * 4); etad.上传(eta.data(), 4);
         Kd.上传(K.data(), K.size() * 4); Vd.上传(V.data(), V.size() * 4);
         Bd.上传(beta.data(), beta.size() * 4); Gd.上传(gamma.data(), gamma.size() * 4);
-        const float tau = (tau_arg > 0.0f) ? tau_arg : (1.0f / std::sqrt(float(DK)));
+        const float tau = (tau_arg > 0.0f) ? tau_arg : 0.005f;
         const AsmPC pc{B, H, M, DK, DV, Rr, 0, 0, tau, tau, 0.9f, 0.01f, -2.0f, 0.0f};
         run("asm_step_eta", {qd.取句柄(), kd.取句柄(), vd.取句柄(), Kd.取句柄(),
                             Vd.取句柄(), Bd.取句柄(), Gd.取句柄(), od.取句柄(),

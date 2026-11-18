@@ -878,7 +878,7 @@ int main(int argc, char** argv) {
 
             if (!L.ersa) {
                 // ASM 单步反向（同时给出 dq/dk/dv/deta 和状态梯度）
-                const float tau = 1.0f / std::sqrt(static_cast<float>(DK));
+                const float tau = 0.005f;
                 const ASMBwdPC ap{B, H, M, R, DK, DV,
                                   tau, tau, 0.9f, 0.01f, L.beta_null};
                 提交2("asm_step_bwd_multi",
@@ -1229,7 +1229,7 @@ int main(int argc, char** argv) {
                            L.block_sum.取句柄(), attn_out.取句柄()},
                           &pc, sizeof(pc), H, 1, 1);
                 } else {
-                    const float tau = 1.0f / std::sqrt(static_cast<float>(DK));
+                    const float tau = 0.005f;
                     const AsmStepPC pc{B, H, M, DK, DV, R, 0, 0,
                                        tau, tau, 0.9f, 0.01f, L.beta_null, 0.0f};
                     提交2("asm_step_eta",
