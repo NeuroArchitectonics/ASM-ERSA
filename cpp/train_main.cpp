@@ -938,11 +938,7 @@ int main(int argc, char** argv) {
                    L.g2wb->p.取句柄(), dBranchUpper[t].取句柄(), dOutTokens.取句柄(),
                    dY.取句柄(), dBranchMid.取句柄(), dW2w.取句柄(), db2w.取句柄()},
                   &g2, sizeof(g2), 1, 1, 1);
-            if (big3b && (li == 0 || li == cfg.n_layers / 2 || li + 1 == cfg.n_layers)) {
-                vk张量& probe = (li == 0) ? dYProbe0[t]
-                    : ((li + 1 == cfg.n_layers) ? dYProbe31[t] : dYProbe16[t]);
-                dY.拷贝到(probe);
-            }
+
             累加(L.g2ww, dW2w);
             累加(L.g2wb, db2w);
 
@@ -962,8 +958,7 @@ int main(int argc, char** argv) {
                    moeShDh.取句柄(), moeXs.取句柄(), moeDys.取句柄(),
                    moeIdxS.取句柄(), moeKwS.取句柄(), moeShSilu.取句柄()},
                   &mdx, sizeof(mdx), 1, 1, 1);
-            if (big3b && li + 1 == cfg.n_layers)
-                dX2.拷贝到(dX2Probe31[t]);
+
 
             const 规格4 gp{1, D, E, 0};
             提交2("linear_bwd_dwdb",
@@ -1098,11 +1093,6 @@ int main(int argc, char** argv) {
                 dO.拷贝到(dOrec[t]);
                 dBranchR.拷贝到(dBranchRec[t]);
             }
-        }
-
-        if (big3b && li + 1 == cfg.n_layers) {
-            for (std::uint32_t q = 0; q < T; ++q)
-                dOrec[q].拷贝到(dOProbe31[q]);
         }
 
         // MoE 权重梯度：每层一次，读 token scratch，不再逐 token 累加。
