@@ -118,8 +118,10 @@ struct QkvFusedPC {
 struct AsmResetPC { std::uint32_t B, H, M, DK, DV, pad0, pad1, pad2; };
 struct AsmStepPC {
     std::uint32_t B, H, M, DK, DV, R, pad0, pad1;
-    float tau, tau_w, rho, lam, null_beta, pad2;
+    float tau, tau_w, rho, lam, null_beta, tau_new, pad2;
 };
+// 新颖性阈值：选中槽位最大 cos 低于它时改写到冷槽，负值关闭门控。
+static constexpr float ASM新颖阈值 = 0.15f;
 struct ErsaStepPC {
     std::uint32_t B, H, T, N, DK, DV, NB, BLOCK, TOPB, WINDOW, QOFF, NBMAX;
     float tau, sink;
@@ -525,7 +527,7 @@ int main(int argc, char** argv) {
             asmKOldAll[li] = 建({T, B * H * M * DK}, 张量类型::浮点32, pre + "Kold");
             asmVOldAll[li] = 建({T, B * H * M * DV}, 张量类型::浮点32, pre + "Vold");
             asmBoldAll[li] = 建({T, B * H * M}, 张量类型::浮点32, pre + "Bold");
-            asmIdxAll[li] = 建({T, B * H * 3 * R}, 张量类型::浮点32, pre + "idx");
+            asmIdxAll[li] = 建({T, B * H * (3 * R + 1)}, 张量类型::浮点32, pre + "idx");
             asmXqAll[li] = 建({T, D}, 张量类型::整数8, pre + "xq");
             asmSxAll[li] = 建({T}, 张量类型::浮点32, pre + "sx");
         }
@@ -1544,7 +1546,8 @@ int main(int argc, char** argv) {
                 } else {
                     const float tau = 0.005f;
                     const AsmStepPC pc{B, H, M, DK, DV, R, t, T,
-                                       tau, tau, 0.9f, 0.01f, L.beta_null, 0.0f};
+                                       tau, tau, 0.9f, 0.01f, L.beta_null,
+                                       ASM新颖阈值, 0.0f};
                     提交2("asm_step_eta",
                           {qkv_q.取句柄(), qkv_k.取句柄(), qkv_v.取句柄(),
                            L.K.取句柄(), L.V.取句柄(), L.beta.取句柄(), L.gamma->p.取句柄(),
@@ -1631,6 +1634,24 @@ int main(int argc, char** argv) {
             if (big3b) {
                 std::printf("3B cache: layers=%u D=%u H=%u Ttot=%u | 参数构建完成\n",
                             cfg.n_layers, D, H, T);
+                // 先测串提交（训练主路径），再开采样跑一遍出热点表。
+                fwd_cache = true;
+                const auto cf0 = std::chrono::steady_clock::now();
+                fwd_cache = true;
+                前向();
+                const auto cf1 = std::chrono::steady_clock::now();
+                清零梯度();
+                bwd_cache = true;
+                const auto cb0 = std::chrono::steady_clock::now();
+                const float loss2 = 反向全部();
+                const auto cb1 = std::chrono::steady_clock::now();
+                const double cfms =
+                    std::chrono::duration<double, std::milli>(cf1 - cf0).count();
+                const double cbms =
+                    std::chrono::duration<double, std::milli>(cb1 - cb0).count();
+                std::printf("3B 串提交实测: fwd %.2f ms | bwd %.2f ms | loss %.6f\n",
+                            cfms, cbms, loss2);
+
                 const auto f0 = std::chrono::steady_clock::now();
                 fwd_cache = true;
                 性能表.clear();
@@ -1655,22 +1676,6 @@ int main(int argc, char** argv) {
                 const double fms = std::chrono::duration<double, std::milli>(f1 - f0).count();
                 const double bms = std::chrono::duration<double, std::milli>(b1 - b0).count();
 
-                // 采样关闭后再整段跑一遍：层内算子串成一条命令缓冲，只等一次。
-                const auto cf0 = std::chrono::steady_clock::now();
-                fwd_cache = true;
-                前向();
-                const auto cf1 = std::chrono::steady_clock::now();
-                清零梯度();
-                bwd_cache = true;
-                const auto cb0 = std::chrono::steady_clock::now();
-                const float loss2 = 反向全部();
-                const auto cb1 = std::chrono::steady_clock::now();
-                const double cfms =
-                    std::chrono::duration<double, std::milli>(cf1 - cf0).count();
-                const double cbms =
-                    std::chrono::duration<double, std::milli>(cb1 - cb0).count();
-                std::printf("3B 串提交实测: fwd %.2f ms | bwd %.2f ms | loss %.6f\n",
-                            cfms, cbms, loss2);
                 size_t grad_elems = 0;
                 for (auto& p : 全部参数) grad_elems += p->n;
                 const auto live = vk底层::缓冲::存活字节计().load();

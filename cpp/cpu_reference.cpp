@@ -135,6 +135,8 @@ void gr_write(float* branches, const float* y, const GRWeights& gr, uint32_t D) 
     }
 }
 
+constexpr float kAsmTauNew = 0.15f;
+
 void asm_step(const float* q, const float* k, const float* v, const float* x,
               const ASMWeights& w, std::vector<float>& K, std::vector<float>& V,
               std::vector<float>& beta, uint32_t H, uint32_t M, uint32_t DK,
@@ -194,9 +196,27 @@ void asm_step(const float* q, const float* k, const float* v, const float* x,
         const float invp = (sump > 0.0f) ? (1.0f / sump) : 0.0f;
         for (uint32_t kk = 0; kk < r; ++kk) p[kk] *= invp;
 
-        for (uint32_t kk = 0; kk < r; ++kk) {
-            const uint32_t m = idx[kk];
-            const float pm = p[kk];
+        // 新颖性门控：选中槽位最大 cos 低于阈值时不覆盖，改写到 beta 最低的冷槽。
+        float maxdot = -1e30f;
+        for (uint32_t kk = 0; kk < r; ++kk)
+            maxdot = std::max(maxdot, (sw[idx[kk]] - bh[idx[kk]]) * tau);
+        const bool novel = (kAsmTauNew > -1.0f) && (maxdot < kAsmTauNew);
+        int32_t cold = -1;
+        if (novel) {
+            float bestb = 1e30f;
+            for (uint32_t m = 0; m < M; ++m) {
+                bool sel = false;
+                for (uint32_t kk = 0; kk < r; ++kk)
+                    if (idx[kk] == m) { sel = true; break; }
+                if (sel) continue;
+                if (bh[m] < bestb) { bestb = bh[m]; cold = int32_t(m); }
+            }
+        }
+
+        const uint32_t wcount = novel ? 1u : r;
+        for (uint32_t kk = 0; kk < wcount; ++kk) {
+            const uint32_t m = novel ? uint32_t(cold) : idx[kk];
+            const float pm = novel ? 1.0f : p[kk];
             const float gm = w.gamma[m];
             float norm2 = 0.0f;
             for (uint32_t d = 0; d < DK; ++d) {

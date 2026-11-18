@@ -103,6 +103,9 @@ class ASM_ERSA_Layer(nn.Module):
         self.n_scales = n_scales
         self.tau = 0.005
         self.tau_w = 0.005
+        # 新颖性门控：选中槽位的最大 cos 低于该值时，写入改投 beta 最低的冷槽，
+        # 避免不相关的新 key 覆盖旧内容（负值关闭）。
+        self.tau_new = 0.15
         self.rho = 0.9
         self.lam = 0.01
 
@@ -182,6 +185,33 @@ class ASM_ERSA_Layer(nn.Module):
         new_K = F.normalize(g_sel.unsqueeze(-1) * K_sel + eta * p.unsqueeze(-1) * k.unsqueeze(2), dim=-1)
         new_V = g_sel.unsqueeze(-1) * V_sel + eta * p.unsqueeze(-1) * v.unsqueeze(2)
         new_beta = self.rho * beta_sel + self.lam * p
+
+        # 新颖性门控：k 与选中槽位最大 cos 低于 tau_new 时不覆盖，
+        # 改写 beta 最低且未被选中的冷槽（p = 1）。
+        kdot = torch.einsum('bhk,bhrk->bhr', k, torch.gather(
+            K, 2, idx.unsqueeze(-1).expand(-1, -1, -1, dk)))
+        novel = kdot.max(dim=-1).values < self.tau_new
+        sel_mask = torch.zeros(B, H, M, dtype=torch.bool, device=x.device)
+        sel_mask.scatter_(2, idx, True)
+        cold = beta.masked_fill(sel_mask, float('inf')).argmin(dim=-1)
+        if novel.any():
+            nf = novel.view(B, H, 1, 1)
+            cold4k = cold.view(B, H, 1, 1).expand(-1, -1, -1, dk)
+            cold4v = cold.view(B, H, 1, 1).expand(-1, -1, -1, dv)
+            K_cold = torch.gather(K, 2, cold4k)
+            V_cold = torch.gather(V, 2, cold4v)
+            b_cold = torch.gather(beta, 2, cold.unsqueeze(-1)).squeeze(-1)
+            g_cold = gamma.expand(B, H, M).gather(2, cold.unsqueeze(-1)).squeeze(-1)
+            K_cold_new = F.normalize(g_cold.unsqueeze(-1) * K_cold + eta * k.unsqueeze(2), dim=-1)
+            V_cold_new = g_cold.unsqueeze(-1) * V_cold + eta * v.unsqueeze(2)
+            b_cold_new = self.rho * b_cold + self.lam
+            new_K = torch.where(nf, K_sel, new_K)
+            new_V = torch.where(nf, V_sel, new_V)
+            new_beta = torch.where(novel.unsqueeze(-1), beta_sel, new_beta)
+            K.scatter_(2, cold4k, torch.where(nf, K_cold_new, K_cold))
+            V.scatter_(2, cold4v, torch.where(nf, V_cold_new, V_cold))
+            beta.scatter_(2, cold.unsqueeze(-1),
+                          torch.where(novel.unsqueeze(-1), b_cold_new, b_cold))
 
         K = K.scatter(2, idx.unsqueeze(-1).expand(-1, -1, -1, dk), new_K)
         V = V.scatter(2, idx.unsqueeze(-1).expand(-1, -1, -1, dv), new_V)

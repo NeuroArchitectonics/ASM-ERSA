@@ -33,7 +33,7 @@ vk张量 mk(std::vector<std::uint32_t> s, 张量类型 t, const char* n) {
 }
 struct AsmPC {
     std::uint32_t B, H, M, DK, DV, R, pad0, pad1;
-    float tau, tau_w, rho, lam, null_beta, pad2;
+    float tau, tau_w, rho, lam, null_beta, tau_new, pad2;
 };
 struct ErsaPC {
     std::uint32_t B, H, T, N, DK, DV, NB, BLOCK, TOPB, WINDOW, QOFF, NBMAX;
@@ -97,15 +97,19 @@ int main(int argc, char** argv) {
         vk张量 Gd = mk({M}, 张量类型::浮点32, "asm.gamma");
         vk张量 od = mk({B, H * DV}, 张量类型::浮点32, "asm.o");
         vk张量 dbg = mk({B, H, 3 * Rr}, 张量类型::浮点32, "asm.dbg");
+        vk张量 dummy = mk({64}, 张量类型::浮点32, "asm.dummy");
         qd.上传(q.data(), q.size() * 4); kd.上传(k.data(), k.size() * 4);
         vd.上传(v.data(), v.size() * 4); etad.上传(eta.data(), 4);
         Kd.上传(K.data(), K.size() * 4); Vd.上传(V.data(), V.size() * 4);
         Bd.上传(beta.data(), beta.size() * 4); Gd.上传(gamma.data(), gamma.size() * 4);
         const float tau = (tau_arg > 0.0f) ? tau_arg : 0.005f;
-        const AsmPC pc{B, H, M, DK, DV, Rr, 0, 0, tau, tau, 0.9f, 0.01f, -2.0f, 0.0f};
+        const AsmPC pc{B, H, M, DK, DV, Rr, 0, 0, tau, tau, 0.9f, 0.01f, -2.0f,
+                      -1.0f, 0.0f};
         run("asm_step_eta", {qd.取句柄(), kd.取句柄(), vd.取句柄(), Kd.取句柄(),
                             Vd.取句柄(), Bd.取句柄(), Gd.取句柄(), od.取句柄(),
-                            etad.取句柄(), dbg.取句柄()},
+                            etad.取句柄(), dbg.取句柄(),
+                            dummy.取句柄(), dummy.取句柄(), dummy.取句柄(),
+                            dummy.取句柄()},
             &pc, sizeof(pc), H, 1);
         std::vector<float> oh(B * H * DV);
         od.下载(oh.data(), oh.size() * 4);
@@ -115,6 +119,94 @@ int main(int argc, char** argv) {
             std::printf("(mass=%.3f)", oh[h * DV]);
         }
         std::printf("\n");
+    }
+
+
+    // ── ASM 新颖性门控：反复写不相似的新 key，不应覆盖旧槽位 ──
+    {
+        const std::uint32_t B = 1, H = 4, M = 512, Rr = 16, DK = 8, DV = 8;
+        const std::uint32_t 轮数 = 64;
+        std::vector<float> K0(B * H * M * DK), V0(B * H * M * DV, 0.0f);
+        std::vector<float> beta0(B * H * M, 0.0f);
+        std::vector<float> gamma(M, 0.99f);
+        std::vector<float> q(B * H * DK), kB(B * H * DK);
+        std::vector<float> vA(B * H * DV, 0.0f), vB(B * H * DV, 0.0f);
+        std::vector<std::uint32_t> targets(H);
+        for (std::uint32_t h = 0; h < H; ++h) {
+            targets[h] = 300u + h;
+            std::vector<float> ka(DK);
+            for (auto& x : ka) x = rnd();
+            norm(ka.data(), DK);
+            for (std::uint32_t m = 0; m < M; ++m) {
+                for (std::uint32_t d = 0; d < DK; ++d)
+                    K0[(h * M + m) * DK + d] = (m == targets[h]) ? ka[d] : rnd();
+                norm(&K0[(h * M + m) * DK], DK);
+            }
+            beta0[h * M + targets[h]] = 0.5f;
+            for (std::uint32_t d = 0; d < DK; ++d) {
+                q[h * DK + d] = ka[d];
+                kB[h * DK + d] = (d == 0u) ? 1.0f : 0.0f;
+            }
+            vA[h * DV] = 1.0f;
+            vB[h * DV + 1u] = 1.0f;
+        }
+        const float tau = (tau_arg > 0.0f) ? tau_arg : 0.005f;
+        auto 跑 = [&](float tau_new, const char* 标签) {
+            vk张量 qd = mk({B, H, DK}, 张量类型::浮点32, "ng.q");
+            vk张量 kd = mk({B, H, DK}, 张量类型::浮点32, "ng.k");
+            vk张量 vd = mk({B, H, DV}, 张量类型::浮点32, "ng.v");
+            vk张量 etad = mk({B}, 张量类型::浮点32, "ng.eta");
+            vk张量 Kd = mk({B, H, M, DK}, 张量类型::浮点32, "ng.K");
+            vk张量 Vd = mk({B, H, M, DV}, 张量类型::浮点32, "ng.V");
+            vk张量 Bd = mk({B, H, M}, 张量类型::浮点32, "ng.beta");
+            vk张量 Gd = mk({M}, 张量类型::浮点32, "ng.gamma");
+            vk张量 od = mk({B, H * DV}, 张量类型::浮点32, "ng.o");
+            vk张量 dbg = mk({B, H, 3 * Rr}, 张量类型::浮点32, "ng.dbg");
+            vk张量 dummy = mk({64}, 张量类型::浮点32, "ng.dummy");
+            vk张量 kAd = mk({B, H, DK}, 张量类型::浮点32, "ng.ka");
+            vk张量 vAd = mk({B, H, DV}, 张量类型::浮点32, "ng.va");
+            qd.上传(q.data(), q.size() * 4);
+            kd.上传(kB.data(), kB.size() * 4);
+            vd.上传(vB.data(), vB.size() * 4);
+            kAd.上传(q.data(), q.size() * 4);          // 锚定写用的 k = k_a
+            vAd.上传(vA.data(), vA.size() * 4);        // 锚定写用的 v = v_a
+            Kd.上传(K0.data(), K0.size() * 4);
+            Vd.上传(V0.data(), V0.size() * 4);
+            Bd.上传(beta0.data(), beta0.size() * 4);
+            Gd.上传(gamma.data(), gamma.size() * 4);
+            const std::vector<张量句柄> hs = {
+                qd.取句柄(), kd.取句柄(), vd.取句柄(), Kd.取句柄(), Vd.取句柄(),
+                Bd.取句柄(), Gd.取句柄(), od.取句柄(), etad.取句柄(), dbg.取句柄(),
+                dummy.取句柄(), dummy.取句柄(), dummy.取句柄(), dummy.取句柄()};
+            std::vector<float> etaW(B, 0.5f), etaR(B, 0.0f);
+            // 先写一次 A 锚定目标槽（k=k_a, v=v_a）
+            {
+                etad.上传(etaW.data(), 4);
+                std::vector<张量句柄> hsa = hs;
+                hsa[1] = kAd.取句柄();
+                hsa[2] = vAd.取句柄();
+                const AsmPC pc{B, H, M, DK, DV, Rr, 0, 0, tau, tau, 0.9f, 0.01f,
+                              -2.0f, tau_new, 0.0f};
+                run("asm_step_eta", hsa, &pc, sizeof(pc), H, 1);
+            }
+            // 反复写不相似的新 key B
+            etad.上传(etaW.data(), 4);
+            const AsmPC pc{B, H, M, DK, DV, Rr, 0, 0, tau, tau, 0.9f, 0.01f,
+                          -2.0f, tau_new, 0.0f};
+            for (std::uint32_t it = 0; it < 轮数; ++it)
+                run("asm_step_eta", hs, &pc, sizeof(pc), H, 1);
+            // 读回 A
+            etad.上传(etaR.data(), 4);
+            run("asm_step_eta", hs, &pc, sizeof(pc), H, 1);
+            std::vector<float> oh(B * H * DV);
+            od.下载(oh.data(), oh.size() * 4);
+            std::printf("[ASM 新颖门控 %s tau_new=%.2f] A 回召:", 标签, tau_new);
+            for (std::uint32_t h = 0; h < H; ++h)
+                std::printf(" h%u=%.3f", h, oh[h * DV]);
+            std::printf("\n");
+        };
+        跑(-1.0f, "关闭");
+        跑(0.90f, "开启");
     }
 
     // ── ERSA：目标块外置于窗口，q 对齐目标 K；检查候选块是否回召目标 V ──
