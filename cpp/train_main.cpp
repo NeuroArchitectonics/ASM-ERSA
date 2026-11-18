@@ -857,12 +857,15 @@ int main(int argc, char** argv) {
     // ERSA 历史梯度
     vk张量 dQH = 建({H, T, DK}, 张量类型::浮点32, "bwd.dQH");
     std::vector<vk张量> dYProbe0, dYProbe16, dYProbe31;
+    std::vector<vk张量> dX2Probe31, dOProbe31;
     vk张量 dQ31, dK31, dV31, dXAll31;
     if (big3b) {
         for (std::uint32_t t = 0; t < T; ++t) {
             dYProbe0.push_back(建({1, D}, 张量类型::浮点32, "probe.dY0"));
             dYProbe16.push_back(建({1, D}, 张量类型::浮点32, "probe.dY16"));
             dYProbe31.push_back(建({1, D}, 张量类型::浮点32, "probe.dY31"));
+            dX2Probe31.push_back(建({1, D}, 张量类型::浮点32, "probe.dX31"));
+            dOProbe31.push_back(建({1, HDV}, 张量类型::浮点32, "probe.dO31"));
         }
         dQ31 = 建({H, T, DK}, 张量类型::浮点32, "probe.dQ31");
         dK31 = 建({H, T, DK}, 张量类型::浮点32, "probe.dK31");
@@ -959,6 +962,8 @@ int main(int argc, char** argv) {
                    moeShDh.取句柄(), moeXs.取句柄(), moeDys.取句柄(),
                    moeIdxS.取句柄(), moeKwS.取句柄(), moeShSilu.取句柄()},
                   &mdx, sizeof(mdx), 1, 1, 1);
+            if (big3b && li + 1 == cfg.n_layers)
+                dX2.拷贝到(dX2Probe31[t]);
 
             const 规格4 gp{1, D, E, 0};
             提交2("linear_bwd_dwdb",
@@ -1093,6 +1098,11 @@ int main(int argc, char** argv) {
                 dO.拷贝到(dOrec[t]);
                 dBranchR.拷贝到(dBranchRec[t]);
             }
+        }
+
+        if (big3b && li + 1 == cfg.n_layers) {
+            for (std::uint32_t q = 0; q < T; ++q)
+                dOrec[q].拷贝到(dOProbe31[q]);
         }
 
         // MoE 权重梯度：每层一次，读 token scratch，不再逐 token 累加。
@@ -1616,7 +1626,26 @@ int main(int argc, char** argv) {
                     std::printf(" L16t%u=%.4g", q, rown(d16, 0));
                 }
                 std::printf("\n");
-                std::printf("  L31 dY t0/t8/t11:");
+                std::printf("  L31 dX2/dO t8/t11:");
+                for (std::uint32_t q : {8u, 11u}) {
+                    std::vector<float> xv(D), ov(HDV);
+                    dX2Probe31[q].下载(xv.data(), xv.size() * 4);
+                    dOProbe31[q].下载(ov.data(), ov.size() * 4);
+                    double sx2 = 0.0, so2 = 0.0;
+                    for (float z : xv) sx2 += double(z) * z;
+                    for (float z : ov) so2 += double(z) * z;
+                    std::printf(" t%u(dX2=%.4g,dO=%.4g)", q,
+                                std::sqrt(sx2), std::sqrt(so2));
+                }
+                std::printf("\n  L31 candidate counts (q0..q3):");
+                for (std::uint32_t q = 0; q < Tq; ++q) {
+                    std::vector<std::int32_t> cc(H);
+                    层表[cfg.n_layers - 1].candCnt[q].下载(cc.data(), cc.size() * 4);
+                    int sum = 0;
+                    for (int z : cc) sum += z;
+                    std::printf(" q%u=%d", q, sum);
+                }
+                std::printf("\n  L31 dY t0/t8/t11:");
                 for (std::uint32_t q : {0u, 8u, 11u}) {
                     dYProbe31[q].下载(d0.data(), d0.size() * 4);
                     std::printf(" t%u=%.4g", q, rown(d0, 0));
