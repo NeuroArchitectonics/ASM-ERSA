@@ -139,7 +139,7 @@ void asm_step(const float* q, const float* k, const float* v, const float* x,
               const ASMWeights& w, std::vector<float>& K, std::vector<float>& V,
               std::vector<float>& beta, uint32_t H, uint32_t M, uint32_t DK,
               uint32_t DV, uint32_t R, float* out) {
-    const float tau = 1.0f / std::sqrt(float(DK));
+    const float tau = 0.005f;
     float eta_acc = w.w_eta_b[0];
     for (std::size_t d = 0; d < w.w_eta_w.size(); ++d) eta_acc += x[d] * w.w_eta_w[d];
     const float eta = sigmoidf(eta_acc);

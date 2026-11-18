@@ -955,7 +955,7 @@ void Impl::append_qkv_head(LayerDev& L, uint32_t t, std::vector<算子步骤>& s
 
 void Impl::append_asm_step(LayerDev& L, std::vector<算子步骤>& steps) {
     const uint32_t H = cfg.n_heads, DK = cfg.d_k, DV = cfg.d_v;
-    const float tau = 1.0f / std::sqrt(static_cast<float>(DK));
+    const float tau = 0.005f;
     const AsmStepPC pc{1, H, cfg.n_slots, DK, DV, cfg.top_r, 0, 0,
                        tau, tau, 0.9f, 0.01f, L.asm_dev.beta_null, 0.0f};
     append_step(steps, "asm_step_eta",

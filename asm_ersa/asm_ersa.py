@@ -101,8 +101,8 @@ class ASM_ERSA_Layer(nn.Module):
         self.n_slots = n_slots
         self.top_r = min(top_r, n_slots)
         self.n_scales = n_scales
-        self.tau = 1.0 / math.sqrt(d_k)
-        self.tau_w = 1.0 / math.sqrt(d_k)
+        self.tau = 0.005
+        self.tau_w = 0.005
         self.rho = 0.9
         self.lam = 0.01
 
