@@ -7,6 +7,7 @@
 #include "cpp/spv/ersa_ivf_attn_bwd_query.spv.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -196,6 +197,65 @@ int main(int argc, char** argv) {
                     cse, use_window ? "topB+window" : "topB only",
                     edq, edk, edv, eds);
         ok = ok && edq <= 1e-6f && edk <= 1e-6f && edv <= 1e-6f && eds <= 1e-6f;
+    }
+
+    if (argc >= 3 && std::string(argv[2]) == "bench") {
+        const std::uint32_t BH = 4, BN = 4608, BDK = 128, BDV = 128;
+        const std::uint32_t BC = 64, BLMAX = 1024, BMPC = BN / BC;
+        const std::uint32_t BTOPB = 8, BWIN = 64;
+        std::vector<float> bq(BH * BDK), bk(std::size_t(BH) * BN * BDK);
+        std::vector<float> bv(std::size_t(BH) * BN * BDV), bdy(BH * BDV);
+        std::vector<float> bc(std::size_t(BH) * BC * BDK);
+        for (auto& x : bq) x = rnd();
+        for (auto& x : bk) x = rnd();
+        for (auto& x : bv) x = rnd();
+        for (auto& x : bdy) x = rnd();
+        for (auto& x : bc) x = rnd();
+        std::vector<std::int32_t> bm(std::size_t(BH) * BC * BLMAX, 0);
+        std::vector<std::int32_t> bn(BH * BC, std::int32_t(BMPC));
+        for (std::uint32_t h = 0; h < BH; ++h) {
+            for (std::uint32_t c = 0; c < BC; ++c) {
+                for (std::uint32_t j = 0; j < BMPC; ++j)
+                    bm[(h * BC + c) * BLMAX + j] = std::int32_t(c * BMPC + j);
+            }
+        }
+        vk张量 q = mk({BH, 1, BDK}, 张量类型::浮点32, "bench.q");
+        vk张量 k = mk({BH, BN, BDK}, 张量类型::浮点32, "bench.k");
+        vk张量 v = mk({BH, BN, BDV}, 张量类型::浮点32, "bench.v");
+        vk张量 c = mk({BH, BC, BDK}, 张量类型::浮点32, "bench.cent");
+        vk张量 m = mk({BH, BC, BLMAX}, 张量类型::整数32, "bench.member");
+        vk张量 n = mk({BH, BC}, 张量类型::整数32, "bench.counts");
+        vk张量 dy = mk({BH, 1, BDV}, 张量类型::浮点32, "bench.dy");
+        vk张量 dq = mk({BH, 1, BDK}, 张量类型::浮点32, "bench.dq");
+        vk张量 dk = mk({BH, BN, BDK}, 张量类型::浮点32, "bench.dk");
+        vk张量 dv = mk({BH, BN, BDV}, 张量类型::浮点32, "bench.dv");
+        vk张量 ds = mk({BH}, 张量类型::浮点32, "bench.dsink");
+        q.上传(bq.data(), bq.size() * 4); k.上传(bk.data(), bk.size() * 4);
+        v.上传(bv.data(), bv.size() * 4); c.上传(bc.data(), bc.size() * 4);
+        m.上传(bm.data(), bm.size() * 4); n.上传(bn.data(), bn.size() * 4);
+        dy.上传(bdy.data(), bdy.size() * 4);
+        fill0(dq); fill0(dk); fill0(dv); fill0(ds);
+        const IvfBwdPC bp{1, BH, 1, BN, BDK, BDV, BC, BLMAX, BTOPB, BWIN,
+                          BN - 1, 0, 0.005f, -4.0f};
+        auto once = [&]() {
+            run("ersa_ivf_attn_bwd_query",
+                {q.取句柄(), k.取句柄(), v.取句柄(), c.取句柄(), m.取句柄(),
+                 n.取句柄(), dy.取句柄(), dq.取句柄(), dk.取句柄(),
+                 dv.取句柄(), ds.取句柄()},
+                &bp, sizeof(bp), 1, BH, 1);
+        };
+        for (int i = 0; i < 2; ++i) once();
+        double best = 1e30;
+        for (int i = 0; i < 10; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            once();
+            const auto t1 = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            best = std::min(best, ms);
+        }
+        std::printf("bench H=%u N=%u DK=%u DV=%u C=%u LMAX=%u topB=%u window=%u: "
+                    "%.3f ms/dispatch\n",
+                    BH, BN, BDK, BDV, BC, BLMAX, BTOPB, BWIN, best);
     }
 
     std::printf("%s\n", ok ? "PASS" : "FAIL");
