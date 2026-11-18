@@ -4,8 +4,10 @@
 
 **Addressable Slot Memory + Exact-Recall Sparse Attention for Long-Context Understanding**
 
-> **状态（2026-11-17）**：包 `asm_ersa` v4.0.0，主类 `ASM_ERSA`；机制参考实现见 `asm_ersa/asm_ersa.py`（`ASM_ERSA_Layer`）。
-> Vulkan 反向/优化器/训练器见 `反向/`、`优化器/`。
+> **状态（2026-11-18）**：主运行路径为 `cpp/` 的 C++ + Vulkan INT8 融合实现（`ASM_ERSAModel`，INT8×INT8，ASM8BIN 权重）。
+> `asm_ersa` Python 包保留为机制参考/数值 oracle，不作为运行时主路径。
+> 当前没有训练过的 checkpoint，也没有设备训练；ASM8BIN 可由未训练/随机权重生成，用于架构与 kernel 验证。
+> Vulkan 反向/优化器 kernel 见 `反向/`、`优化器/`；当前没有完整设备训练器。
 > 下文性能表与部分机制描述仍沿用旧口径（标 ⚠️ 处未复核），正在按 ASM-ERSA 设计重写，请以代码为准。
 
 ---
@@ -35,6 +37,8 @@ ASM-ERSA 是一种混合 Transformer 架构：用可寻址槽位记忆（ASM）�
 | 训练内存 | ~61 GB（bf16，含优化器状态，未实测） |
 
 ### Vulkan 张量计算系统
+
+**主运行路径**：`cpp/`（C++ + Vulkan INT8 融合 shader，ASM8BIN 权重）。Python `asm_ersa` 仅保留为参考/oracle。
 
 本项目基于 **Vulkan 张量计算系统**，用于高效部署 ASM-ERSA 模型。该系统基于 Vulkan Compute API，支持：
 
