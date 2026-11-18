@@ -106,6 +106,11 @@ public:
     ASM_ERSAModel& operator=(ASM_ERSAModel&&) noexcept;
 
     std::vector<float> forward(const std::vector<int32_t>& input_ids);
+    // 全模型 prefill/query：context 先逐 token 走完全部层并写入 ERSA K/V
+    // cache，随后在 cache 上建 IVF，query token 的 ERSA 层走 IVF 路由。
+    // 返回 query 段的 logits [Tq,V]。
+    std::vector<float> forward_cached(const std::vector<int32_t>& context_ids,
+                                      const std::vector<int32_t>& query_ids);
     // 独立 N 的 ERSA KV-cache forward：Q [H,T,DK]，K [H,N,DK]，V [H,N,DV]，
     // 返回 [H,T,DV]；索引与 attention 都在 VK 上。
     std::vector<float> ersa_ivf_forward(const std::vector<float>& q,
@@ -119,6 +124,7 @@ public:
     const ModelConfig& config() const;
     uint64_t last_dispatch_count() const;
     uint64_t last_sync_count() const;
+    uint32_t last_ivf_layer_count() const;
 
 private:
     std::unique_ptr<Impl> impl_;

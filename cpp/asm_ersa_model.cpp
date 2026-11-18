@@ -28,6 +28,15 @@
 #include "cpp/spv/wo_gr_route_fused.spv.hpp"
 #include "cpp/spv/moe_experts_fused.spv.hpp"
 #include "cpp/spv/moe_reduce_grwrite_fused.spv.hpp"
+#include "cpp/spv/ersa_ivf_attn_fused.spv.hpp"
+#include "cpp/spv/ivf_init_centroids.spv.hpp"
+#include "cpp/spv/copy_f32_slice.spv.hpp"
+#include "cpp/spv/kmeans_assign.spv.hpp"
+#include "cpp/spv/kmeans_update.spv.hpp"
+#include "cpp/spv/kmeans_fill_members.spv.hpp"
+#include "cpp/spv/kmeans_inc_assign.spv.hpp"
+#include "cpp/spv/kmeans_inc_append.spv.hpp"
+#include "cpp/spv/kmeans_inc_update.spv.hpp"
 #include "spv/linear_fwd_int8_f32.spv.hpp"
 #include "ersa_head_index.hpp"
 
@@ -118,6 +127,16 @@ struct LmHeadPC {
     uint32_t T, D, V, TILE, pad0, pad1, pad2, pad3;
 };
 static_assert(sizeof(LmHeadPC) == 32, "LmHeadPC must be 32 bytes");
+
+struct IvfInitPC {
+    uint32_t H, N, DK, C, pad0, pad1, pad2, pad3;
+};
+static_assert(sizeof(IvfInitPC) == 32, "IvfInitPC must be 32 bytes");
+
+struct CopySlicePC {
+    uint32_t H, SRC_N, DST_N, D, ROWS, pad0, pad1, pad2;
+};
+static_assert(sizeof(CopySlicePC) == 32, "CopySlicePC must be 32 bytes");
 
 void require_size(const std::vector<float>& v, std::size_t expected, const std::string& name) {
     if (v.size() != expected) {
@@ -261,6 +280,11 @@ struct ERSADev {
     vk张量 Wq_i8, Wq_s, Wk_i8, Wk_s, Wv_i8, Wv_s, Wo_i8, Wo_s;
     vk张量 out_norm;
     vk张量 q_hist, k_hist, v_hist, block_sum;
+    // Prefill cache: compact [H,Nctx,*] so k-means can use N as its stride.
+    vk张量 q_cache, k_cache, v_cache;
+    // Decode cache: [H,Nctx+Tq,*], context rows copied from the prefill cache.
+    vk张量 dk_cache, dv_cache;
+    vk张量 cent, counts, member, assign;
     float sink = -4.0f;
 };
 
@@ -297,6 +321,14 @@ struct Impl {
     vk张量 xq, sx, wo_y, wo_deq, h_q, h_s;
     vk张量 qkv_q, qkv_k, qkv_v, o, attn_out, eta, dbg, block_sum_dummy;
     vk张量 eta_w_dummy, eta_b_dummy;
+    vk张量 q_one, ivf_assign_new, ivf_overflow;
+
+    uint32_t cache_ctx = 0;
+    uint32_t cache_cap = 0;
+    uint32_t cache_C = 0;
+    uint32_t cache_member_cap = 0;
+    uint32_t cache_nbmax = 0;
+    uint32_t cache_ivf_layers = 0;
 
     uint64_t dispatch_count = 0;
     uint64_t sync_count = 0;
@@ -304,6 +336,18 @@ struct Impl {
     Impl(const ModelConfig& cfg_, const ModelWeights* weights, const std::string* path,
          bool synthetic = false);
     std::vector<float> forward(const std::vector<int32_t>& input_ids);
+    std::vector<float> forward_cached(const std::vector<int32_t>& context_ids,
+                                      const std::vector<int32_t>& query_ids);
+    void ensure_ersa_cache(uint32_t nctx, uint32_t cap);
+    void build_ersa_index(LayerDev& L);
+    void append_qkv_prefill(LayerDev& L, uint32_t pos,
+                            std::vector<算子步骤>& steps);
+    void append_qkv_decode(LayerDev& L, uint32_t pos,
+                           std::vector<算子步骤>& steps);
+    void append_ersa_prefill(LayerDev& L, uint32_t pos,
+                             std::vector<算子步骤>& steps);
+    void append_ersa_decode(LayerDev& L, uint32_t pos,
+                            std::vector<算子步骤>& steps);
     std::vector<float> ersa_ivf_forward(const std::vector<float>& q,
                                         const std::vector<float>& k,
                                         const std::vector<float>& v,
@@ -673,6 +717,9 @@ Impl::Impl(const ModelConfig& cfg_, const ModelWeights* weights, const std::stri
     block_sum_dummy = make_empty_f32({1}, "block_sum_dummy");
     eta_w_dummy = make_f32({D}, std::vector<float>(D, 0.0f), "eta_w_dummy");
     eta_b_dummy = make_f32({1}, std::vector<float>(1, 0.0f), "eta_b_dummy");
+    q_one = make_empty_f32({H, 1, DK}, "ersa_q_one");
+    ivf_assign_new = vk张量(张量布局::连续({H, 1}), 张量类型::整数32,
+                            "ivf_assign_new");
 
     layers.reserve(cfg.n_layers);
     for (uint32_t i = 0; i < cfg.n_layers; ++i) {
@@ -1047,6 +1094,323 @@ void Impl::append_moe_reduce(LayerDev& L, uint32_t t, bool write_out,
                 rp, 1, 1, 1);
 }
 
+void Impl::ensure_ersa_cache(uint32_t nctx, uint32_t cap) {
+    const uint32_t H = cfg.n_heads, DK = cfg.d_k, DV = cfg.d_v;
+    const uint32_t C = std::min<uint32_t>(64, nctx);
+    if (nctx == 0 || cap < nctx || C == 0) {
+        throw std::runtime_error("ERSA cache 维度非法");
+    }
+    cache_ctx = nctx;
+    cache_cap = cap;
+    cache_C = C;
+    cache_member_cap = std::max<uint32_t>(64, std::min<uint32_t>(1024, cap));
+    cache_nbmax = (cap + cfg.block_size - 1) / cfg.block_size;
+    cache_ivf_layers = 0;
+
+    const uint32_t bs_nb = std::max(cache_nbmax, NBmax);
+    for (auto& lp : layers) {
+        if (!lp->is_ersa) continue;
+        ERSADev& E = lp->ersa_dev;
+        const std::string p = "ersa_cache";
+        E.q_cache = make_empty_f32({H, nctx, DK}, p + ".q");
+        E.k_cache = make_empty_f32({H, nctx, DK}, p + ".k");
+        E.v_cache = make_empty_f32({H, nctx, DV}, p + ".v");
+        E.dk_cache = make_empty_f32({H, cap, DK}, p + ".dk");
+        E.dv_cache = make_empty_f32({H, cap, DV}, p + ".dv");
+        E.cent = make_empty_f32({H, C, DK}, p + ".cent");
+        E.counts = vk张量(张量布局::连续({H, C}), 张量类型::整数32, p + ".counts");
+        E.member = vk张量(张量布局::连续({H, C, cache_member_cap}),
+                          张量类型::整数32, p + ".member");
+        E.assign = vk张量(张量布局::连续({H, nctx}), 张量类型::整数32,
+                          p + ".assign");
+        E.block_sum = make_empty_f32({H, bs_nb, DK}, p + ".block_sum");
+
+        std::vector<int32_t> zero_c(std::size_t(H) * C, 0);
+        E.counts.上传(zero_c.data(), zero_c.size() * sizeof(int32_t));
+        std::vector<int32_t> zero_n(std::size_t(H) * nctx, 0);
+        E.assign.上传(zero_n.data(), zero_n.size() * sizeof(int32_t));
+    }
+    ivf_overflow = vk张量(张量布局::连续({H, C}), 张量类型::整数32,
+                          "ivf_overflow");
+    std::vector<int32_t> zero_c(std::size_t(H) * C, 0);
+    ivf_overflow.上传(zero_c.data(), zero_c.size() * sizeof(int32_t));
+}
+
+void Impl::build_ersa_index(LayerDev& L) {
+    ERSADev& E = L.ersa_dev;
+    const uint32_t H = cfg.n_heads, DK = cfg.d_k;
+    const int iters = 10;
+    流水线调度器& sched = 流水线调度器::获取();
+    auto submit = [&](const char* name, std::vector<张量句柄> ins,
+                      const void* pc, uint32_t bytes,
+                      uint32_t gx, uint32_t gy, uint64_t dep) {
+        const uint64_t id = dep == 0
+            ? sched.提交自定义算子(name, std::move(ins), pc, bytes,
+                                  派发规格{gx, gy, 1})
+            : sched.提交自定义算子(name, std::move(ins), pc, bytes,
+                                  派发规格{gx, gy, 1}, {dep});
+        ++dispatch_count;
+        return id;
+    };
+
+    const IvfInitPC ip{H, cache_ctx, DK, cache_C, 0, 0, 0, 0};
+    uint64_t prev = submit("ivf_init_centroids",
+                           {E.k_cache.取句柄(), E.cent.取句柄()},
+                           &ip, sizeof(ip), cache_C, H, 0);
+    const asm_ersa::KParams kp{1, H, cache_ctx, DK, cache_C, 0, 0, 0};
+    for (int it = 0; it < iters; ++it) {
+        const uint64_t ta = submit("kmeans_assign",
+                                   {E.k_cache.取句柄(), E.cent.取句柄(),
+                                    E.assign.取句柄()},
+                                   &kp, sizeof(kp), cache_ctx, H, prev);
+        prev = submit("kmeans_update",
+                      {E.k_cache.取句柄(), E.assign.取句柄(),
+                       E.cent.取句柄(), E.counts.取句柄()},
+                      &kp, sizeof(kp), cache_C, H, ta);
+    }
+    const asm_ersa::FillParams fp{1, H, cache_ctx, cache_C,
+                                  cache_member_cap, 0, 0, 0};
+    const uint64_t fill = submit("kmeans_fill_members",
+                                 {E.assign.取句柄(), E.member.取句柄()},
+                                 &fp, sizeof(fp), cache_C, H, prev);
+    sched.等待(fill);
+    if (!sched.已完成(fill)) {
+        throw std::runtime_error("ERSA IVF 建索引失败: " +
+                                 sched.查询失败原因(fill));
+    }
+    ++sync_count;
+
+    std::vector<int32_t> counts(std::size_t(H) * cache_C, 0);
+    E.counts.下载(counts.data(), counts.size() * sizeof(int32_t));
+    uint32_t max_cluster = 0;
+    for (int32_t v : counts) {
+        if (v < 0) throw std::runtime_error("ERSA IVF 计数非法");
+        max_cluster = std::max(max_cluster, static_cast<uint32_t>(v));
+    }
+    if (max_cluster > cache_member_cap) {
+        throw std::runtime_error("ERSA IVF 单簇 " + std::to_string(max_cluster) +
+                                 " 超过 member cap " +
+                                 std::to_string(cache_member_cap));
+    }
+}
+
+void Impl::append_qkv_prefill(LayerDev& L, uint32_t pos,
+                              std::vector<算子步骤>& steps) {
+    const uint32_t H = cfg.n_heads, DK = cfg.d_k, DV = cfg.d_v;
+    const uint32_t D = cfg.d_model;
+    ERSADev& E = L.ersa_dev;
+    const QkvGemvPC pq{1, D, H, DK, DV, cache_ctx, pos, 0, 1,
+                       cache_nbmax, cfg.block_size, 0};
+    const QkvGemvPC pk{1, D, H, DK, DV, cache_ctx, pos, 1, 1,
+                       cache_nbmax, cfg.block_size, 0};
+    const QkvGemvPC pv{1, D, H, DK, DV, cache_ctx, pos, 2, 1,
+                       cache_nbmax, cfg.block_size, 0};
+    append_step(steps, "qkv_gemv_int8",
+                {xq.取句柄(), sx.取句柄(), E.Wq_i8.取句柄(), E.Wq_s.取句柄(),
+                 E.q_cache.取句柄(), block_sum_dummy.取句柄(), qkv_norm.取句柄()},
+                pq, H, 1, 1);
+    append_step(steps, "qkv_gemv_int8",
+                {xq.取句柄(), sx.取句柄(), E.Wk_i8.取句柄(), E.Wk_s.取句柄(),
+                 E.k_cache.取句柄(), E.block_sum.取句柄(), qkv_norm.取句柄()},
+                pk, H, 1, 1);
+    append_step(steps, "qkv_gemv_int8",
+                {xq.取句柄(), sx.取句柄(), E.Wv_i8.取句柄(), E.Wv_s.取句柄(),
+                 E.v_cache.取句柄(), block_sum_dummy.取句柄(), qkv_norm.取句柄()},
+                pv, H, 1, 1);
+}
+
+void Impl::append_qkv_decode(LayerDev& L, uint32_t pos,
+                             std::vector<算子步骤>& steps) {
+    const uint32_t H = cfg.n_heads, DK = cfg.d_k, DV = cfg.d_v;
+    const uint32_t D = cfg.d_model;
+    ERSADev& E = L.ersa_dev;
+    const QkvGemvPC pq{1, D, H, DK, DV, 1, 0, 0, 1,
+                       cache_nbmax, cfg.block_size, 0};
+    const QkvGemvPC pk{1, D, H, DK, DV, cache_cap, pos, 1, 1,
+                       cache_nbmax, cfg.block_size, 0};
+    const QkvGemvPC pv{1, D, H, DK, DV, cache_cap, pos, 2, 1,
+                       cache_nbmax, cfg.block_size, 0};
+    append_step(steps, "qkv_gemv_int8",
+                {xq.取句柄(), sx.取句柄(), E.Wq_i8.取句柄(), E.Wq_s.取句柄(),
+                 q_one.取句柄(), block_sum_dummy.取句柄(), qkv_norm.取句柄()},
+                pq, H, 1, 1);
+    append_step(steps, "qkv_gemv_int8",
+                {xq.取句柄(), sx.取句柄(), E.Wk_i8.取句柄(), E.Wk_s.取句柄(),
+                 E.dk_cache.取句柄(), E.block_sum.取句柄(), qkv_norm.取句柄()},
+                pk, H, 1, 1);
+    append_step(steps, "qkv_gemv_int8",
+                {xq.取句柄(), sx.取句柄(), E.Wv_i8.取句柄(), E.Wv_s.取句柄(),
+                 E.dv_cache.取句柄(), block_sum_dummy.取句柄(), qkv_norm.取句柄()},
+                pv, H, 1, 1);
+}
+
+void Impl::append_ersa_prefill(LayerDev& L, uint32_t pos,
+                               std::vector<算子步骤>& steps) {
+    const uint32_t H = cfg.n_heads, DK = cfg.d_k, DV = cfg.d_v;
+    const uint32_t N = pos + 1;
+    const uint32_t NB = (N + cfg.block_size - 1) / cfg.block_size;
+    if (NB > 128) throw std::runtime_error("ERSA prefill block 数超过 128");
+    ERSADev& E = L.ersa_dev;
+    const ErsaStepPC pc{1, H, cache_ctx, N, DK, DV, NB, cfg.block_size,
+                        cfg.top_blocks, cfg.window, pos, cache_nbmax,
+                        0.005f, E.sink};
+    append_step(steps, "ersa_attn_step",
+                {E.q_cache.取句柄(), E.k_cache.取句柄(), E.v_cache.取句柄(),
+                 E.block_sum.取句柄(), attn_out.取句柄()},
+                pc, H, 1, 1);
+}
+
+void Impl::append_ersa_decode(LayerDev& L, uint32_t pos,
+                              std::vector<算子步骤>& steps) {
+    const uint32_t H = cfg.n_heads, DK = cfg.d_k, DV = cfg.d_v;
+    ERSADev& E = L.ersa_dev;
+    const asm_ersa::IncAssignParams iap{1, H, 1, DK, cache_C,
+                                        cache_cap, pos, 0};
+    const asm_ersa::IncAppendParams app{1, H, 1, cache_C, cache_member_cap,
+                                        pos, 0, 0};
+    const asm_ersa::IncUpdateParams iup{1, H, 1, DK, cache_C,
+                                        cache_cap, pos, 0, 0.2f, 0, 0, 0};
+    append_step(steps, "kmeans_inc_assign",
+                {E.dk_cache.取句柄(), E.cent.取句柄(), ivf_assign_new.取句柄()},
+                iap, 1, H, 1);
+    append_step(steps, "kmeans_inc_append",
+                {ivf_assign_new.取句柄(), E.counts.取句柄(),
+                 E.member.取句柄(), ivf_overflow.取句柄()},
+                app, cache_C, H, 1);
+    append_step(steps, "kmeans_inc_update",
+                {E.dk_cache.取句柄(), ivf_assign_new.取句柄(),
+                 E.cent.取句柄(), E.counts.取句柄()},
+                iup, cache_C, H, 1);
+
+    const uint32_t topb = std::min<uint32_t>(8, cache_C);
+    const asm_ersa::IvfParams ivp{1, H, 1, cache_cap, DK, DV,
+                                  cache_C, cache_member_cap, topb,
+                                  cfg.window, pos, 0, 0.005f, E.sink};
+    append_step(steps, "ersa_ivf_attn_fused",
+                {q_one.取句柄(), E.dk_cache.取句柄(), E.dv_cache.取句柄(),
+                 E.cent.取句柄(), E.member.取句柄(), E.counts.取句柄(),
+                 attn_out.取句柄()},
+                ivp, 1, H, 1);
+}
+
+std::vector<float> Impl::forward_cached(const std::vector<int32_t>& context_ids,
+                                        const std::vector<int32_t>& query_ids) {
+    const uint32_t nctx = static_cast<uint32_t>(context_ids.size());
+    const uint32_t Tq = static_cast<uint32_t>(query_ids.size());
+    if (nctx == 0 || Tq == 0) {
+        throw std::runtime_error("forward_cached: context/query 不能为空");
+    }
+    if (nctx > Tmax || Tq > Tmax) {
+        throw std::runtime_error("forward_cached: 长度超过 max_seq_len");
+    }
+    if (uint64_t(nctx) + uint64_t(Tq) > 8192u) {
+        throw std::runtime_error("forward_cached: context+query 超过 8192");
+    }
+    auto check_ids = [&](const std::vector<int32_t>& v) {
+        for (int32_t id : v) {
+            if (id < 0 || static_cast<uint32_t>(id) >= cfg.vocab_size) {
+                throw std::runtime_error("forward_cached: input id 超出 vocab_size");
+            }
+        }
+    };
+    check_ids(context_ids);
+    check_ids(query_ids);
+
+    dispatch_count = 0;
+    sync_count = 0;
+    ensure_ersa_cache(nctx, nctx + Tq);
+    reset_states();
+
+    ids.上传(context_ids.data(), context_ids.size() * sizeof(int32_t));
+    for (uint32_t t = 0; t < nctx; ++t) {
+        std::vector<算子步骤> steps;
+        steps.reserve(std::size_t(cfg.n_layers) * 10u);
+        for (uint32_t li = 0; li < cfg.n_layers; ++li) {
+            LayerDev& L = *layers[li];
+            append_gr_read(L, li, t, steps);
+            if (L.is_ersa) {
+                append_qkv_prefill(L, t, steps);
+                append_ersa_prefill(L, t, steps);
+            } else {
+                append_qkv_head(L, t, steps);
+                append_asm_step(L, steps);
+            }
+            append_wo_tile(L, steps);
+            append_norm_route(L, steps);
+            append_moe_h(L, steps);
+            append_moe_out(L, steps);
+            append_moe_reduce(L, t, false, steps);
+        }
+        submit_chain(std::move(steps));
+    }
+
+    for (auto& lp : layers) {
+        if (!lp->is_ersa) continue;
+        LayerDev& L = *lp;
+        build_ersa_index(L);
+        const CopySlicePC ck{cfg.n_heads, nctx, cache_cap, cfg.d_k, nctx, 0, 0, 0};
+        run("copy_f32_slice",
+            {L.ersa_dev.k_cache.取句柄(), L.ersa_dev.dk_cache.取句柄()},
+            &ck, sizeof(ck), nctx, cfg.n_heads, 1);
+        const CopySlicePC cv{cfg.n_heads, nctx, cache_cap, cfg.d_v, nctx, 0, 0, 0};
+        run("copy_f32_slice",
+            {L.ersa_dev.v_cache.取句柄(), L.ersa_dev.dv_cache.取句柄()},
+            &cv, sizeof(cv), nctx, cfg.n_heads, 1);
+        ++cache_ivf_layers;
+    }
+
+    ids.上传(query_ids.data(), query_ids.size() * sizeof(int32_t));
+    for (uint32_t t = 0; t < Tq; ++t) {
+        const uint32_t pos = nctx + t;
+        std::vector<算子步骤> steps;
+        steps.reserve(std::size_t(cfg.n_layers) * 12u);
+        for (uint32_t li = 0; li < cfg.n_layers; ++li) {
+            LayerDev& L = *layers[li];
+            append_gr_read(L, li, t, steps);
+            if (L.is_ersa) {
+                append_qkv_decode(L, pos, steps);
+                append_ersa_decode(L, pos, steps);
+            } else {
+                append_qkv_head(L, t, steps);
+                append_asm_step(L, steps);
+            }
+            append_wo_tile(L, steps);
+            append_norm_route(L, steps);
+            append_moe_h(L, steps);
+            append_moe_out(L, steps);
+            append_moe_reduce(L, t, li + 1 == cfg.n_layers, steps);
+        }
+        submit_chain(std::move(steps));
+    }
+
+    const uint32_t D = cfg.d_model, V = cfg.vocab_size;
+    const RMSNormPC np{Tq, D, 1e-6f, 0};
+    const LmHeadPC lp{Tq, D, V, 64, 0, 0, 0, 0};
+    const uint32_t vtiles = (V + 63) / 64;
+    std::vector<算子步骤> final_steps;
+    append_step(final_steps, "rmsnorm_quant",
+                {out_tokens.取句柄(), final_norm_w.取句柄(),
+                 normed_q.取句柄(), normed_s.取句柄()},
+                np, Tq, 1, 1);
+    append_step(final_steps, "lm_head_gemv_int8",
+                {normed_q.取句柄(), normed_s.取句柄(), lm_head_i8.取句柄(),
+                 lm_head_s.取句柄(), logits.取句柄()},
+                lp, vtiles, Tq, 1);
+    submit_chain(std::move(final_steps));
+
+    std::vector<int32_t> overflow(std::size_t(cfg.n_heads) * cache_C, 0);
+    ivf_overflow.下载(overflow.data(), overflow.size() * sizeof(int32_t));
+    for (int32_t v : overflow) {
+        if (v != 0) {
+            throw std::runtime_error("ERSA IVF decode member 溢出");
+        }
+    }
+
+    std::vector<float> result(static_cast<std::size_t>(Tq) * V);
+    logits.下载(result.data(), result.size() * sizeof(float));
+    return result;
+}
+
 std::vector<float> Impl::forward(const std::vector<int32_t>& input_ids) {
     const uint32_t T = static_cast<uint32_t>(input_ids.size());
     if (T == 0) throw std::runtime_error("input_ids 不能为空");
@@ -1303,6 +1667,12 @@ std::vector<float> ASM_ERSAModel::forward(const std::vector<int32_t>& input_ids)
     return impl_->forward(input_ids);
 }
 
+std::vector<float> ASM_ERSAModel::forward_cached(
+    const std::vector<int32_t>& context_ids,
+    const std::vector<int32_t>& query_ids) {
+    return impl_->forward_cached(context_ids, query_ids);
+}
+
 std::vector<float> ASM_ERSAModel::ersa_ivf_forward(
     const std::vector<float>& q, const std::vector<float>& k,
     const std::vector<float>& v, uint32_t heads, uint32_t T, uint32_t N,
@@ -1324,6 +1694,10 @@ uint64_t ASM_ERSAModel::last_dispatch_count() const {
 
 uint64_t ASM_ERSAModel::last_sync_count() const {
     return impl_->sync_count;
+}
+
+uint32_t ASM_ERSAModel::last_ivf_layer_count() const {
+    return impl_->cache_ivf_layers;
 }
 
 } // namespace asm_ersa_model
