@@ -106,6 +106,15 @@ public:
     ASM_ERSAModel& operator=(ASM_ERSAModel&&) noexcept;
 
     std::vector<float> forward(const std::vector<int32_t>& input_ids);
+    // 独立 N 的 ERSA KV-cache forward：Q [H,T,DK]，K [H,N,DK]，V [H,N,DV]，
+    // 返回 [H,T,DV]；索引与 attention 都在 VK 上。
+    std::vector<float> ersa_ivf_forward(const std::vector<float>& q,
+                                        const std::vector<float>& k,
+                                        const std::vector<float>& v,
+                                        uint32_t heads, uint32_t T, uint32_t N,
+                                        uint32_t C = 64, uint32_t topb = 8,
+                                        uint32_t window = 8, float tau = 0.005f,
+                                        float sink = -30.0f);
     void profile_stages(uint32_t t = 0, uint32_t reps = 20);
     const ModelConfig& config() const;
     uint64_t last_dispatch_count() const;

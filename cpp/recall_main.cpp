@@ -62,13 +62,13 @@ int main(int argc, char** argv) {
 
     // ── ASM：写入目标槽位后，用 q=K[target] 精确读回 V[target] ──
     {
-        const std::uint32_t B = 1, H = 4, M = 16, Rr = 4, DK = 8, DV = 8;
+        const std::uint32_t B = 1, H = 4, M = 512, Rr = 16, DK = 8, DV = 8;
         std::vector<float> K(B * H * M * DK), V(B * H * M * DV), beta(B * H * M, 0.0f);
         std::vector<float> gamma(M, 1.0f);
         std::vector<float> q(B * H * DK), k(B * H * DK), v(B * H * DV), eta(B, 0.5f);
         std::vector<std::uint32_t> targets(H);
         for (std::uint32_t h = 0; h < H; ++h) {
-            std::uint32_t target = 3u + h * 2u;
+            std::uint32_t target = 300u + h;
             targets[h] = target;
             std::vector<float> needle(DK);
             for (auto& x : needle) x = rnd();
@@ -109,7 +109,7 @@ int main(int argc, char** argv) {
             &pc, sizeof(pc), H, 1);
         std::vector<float> oh(B * H * DV);
         od.下载(oh.data(), oh.size() * 4);
-        std::printf("[ASM recall tau=%.3g] target slots:", tau);
+        std::printf("[ASM recall tau=%.3g M=512 R=16] target slots:", tau);
         for (std::uint32_t h = 0; h < H; ++h) {
             std::printf(" %u", targets[h]);
             std::printf("(mass=%.3f)", oh[h * DV]);
@@ -119,8 +119,8 @@ int main(int argc, char** argv) {
 
     // ── ERSA：目标块外置于窗口，q 对齐目标 K；检查候选块是否回召目标 V ──
     {
-        const std::uint32_t B = 1, H = 4, T = 64, N = 64, DK = 8, DV = 8;
-        const std::uint32_t BLOCK = 8, NB = 8, TOPB = 2, WINDOW = 8, QOFF = 63, NBMAX = 8;
+        const std::uint32_t B = 1, H = 4, T = 512, N = 512, DK = 8, DV = 8;
+        const std::uint32_t BLOCK = 64, NB = 8, TOPB = 2, WINDOW = 64, QOFF = 511, NBMAX = 8;
         std::vector<float> q(H * T * DK), k(H * T * DK), v(H * T * DV);
         std::vector<float> bs(H * NBMAX * DK, 0.0f);
         std::vector<std::uint32_t> target(H);
@@ -165,7 +165,7 @@ int main(int argc, char** argv) {
             &pc, sizeof(pc), H, 1);
         std::vector<float> oh(H * DV);
         od.下载(oh.data(), oh.size() * 4);
-        std::printf("[ERSA recall tau=%.3g] target tokens:", (tau_arg > 0.0f) ? tau_arg : 0.005f);
+        std::printf("[ERSA recall tau=%.3g main per-token T=N=512] target tokens:", (tau_arg > 0.0f) ? tau_arg : 0.005f);
         for (std::uint32_t h = 0; h < H; ++h)
             std::printf(" %u(mass=%.3f)", target[h], oh[h * DV]);
         std::printf("\n");
