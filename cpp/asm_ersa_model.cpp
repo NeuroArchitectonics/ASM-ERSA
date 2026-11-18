@@ -29,6 +29,7 @@
 #include "cpp/spv/moe_experts_fused.spv.hpp"
 #include "cpp/spv/moe_reduce_grwrite_fused.spv.hpp"
 #include "spv/linear_fwd_int8_f32.spv.hpp"
+#include "ersa_head_index.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -303,6 +304,12 @@ struct Impl {
     Impl(const ModelConfig& cfg_, const ModelWeights* weights, const std::string* path,
          bool synthetic = false);
     std::vector<float> forward(const std::vector<int32_t>& input_ids);
+    std::vector<float> ersa_ivf_forward(const std::vector<float>& q,
+                                        const std::vector<float>& k,
+                                        const std::vector<float>& v,
+                                        uint32_t heads, uint32_t T, uint32_t N,
+                                        uint32_t C, uint32_t topb, uint32_t window,
+                                        float tau, float sink);
 
     void run(const char* name, std::vector<张量句柄> ins, const void* push,
              uint32_t push_bytes, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1);
@@ -1098,6 +1105,40 @@ std::vector<float> Impl::forward(const std::vector<int32_t>& input_ids) {
     return result;
 }
 
+std::vector<float> Impl::ersa_ivf_forward(
+    const std::vector<float>& q, const std::vector<float>& k,
+    const std::vector<float>& v, uint32_t heads, uint32_t T, uint32_t N,
+    uint32_t C, uint32_t topb, uint32_t window, float tau, float sink) {
+    const uint32_t DK = cfg.d_k, DV = cfg.d_v;
+    if (heads == 0 || T == 0 || N == 0 || C == 0 || DK == 0 || DV == 0)
+        throw std::runtime_error("ersa_ivf_forward: 维度不能为 0");
+    if (q.size() != std::size_t(heads) * T * DK ||
+        k.size() != std::size_t(heads) * N * DK ||
+        v.size() != std::size_t(heads) * N * DV)
+        throw std::runtime_error("ersa_ivf_forward: Q/K/V 大小不匹配");
+
+    流水线调度器& sched = 流水线调度器::获取();
+    std::vector<float> out(std::size_t(heads) * T * DV);
+    for (uint32_t h = 0; h < heads; ++h) {
+        asm_ersa::HeadIndexConfig hc;
+        hc.N = N; hc.N0 = N; hc.C = C; hc.DK = DK; hc.DV = DV; hc.T = T;
+        hc.CAP = 512; hc.TOPB = topb; hc.WINDOW = window;
+        hc.tau = tau; hc.sink = sink;
+        asm_ersa::HeadIndex idx(sched, hc);
+        std::vector<float> kh(k.begin() + std::size_t(h) * N * DK,
+                              k.begin() + std::size_t(h + 1) * N * DK);
+        std::vector<float> vh(v.begin() + std::size_t(h) * N * DV,
+                              v.begin() + std::size_t(h + 1) * N * DV);
+        std::vector<float> qh(q.begin() + std::size_t(h) * T * DK,
+                              q.begin() + std::size_t(h + 1) * T * DK);
+        idx.set_data(kh, vh, qh);
+        idx.build_initial(10, 512);
+        const std::uint64_t task = idx.submit_attention();
+        idx.wait_and_download(task, out.data() + std::size_t(h) * T * DV);
+    }
+    return out;
+}
+
 void Impl::profile_stages(uint32_t t, uint32_t reps) {
     if (layers.empty()) return;
     LayerDev& L0 = *layers[0];
@@ -1260,6 +1301,13 @@ ASM_ERSAModel& ASM_ERSAModel::operator=(ASM_ERSAModel&&) noexcept = default;
 
 std::vector<float> ASM_ERSAModel::forward(const std::vector<int32_t>& input_ids) {
     return impl_->forward(input_ids);
+}
+
+std::vector<float> ASM_ERSAModel::ersa_ivf_forward(
+    const std::vector<float>& q, const std::vector<float>& k,
+    const std::vector<float>& v, uint32_t heads, uint32_t T, uint32_t N,
+    uint32_t C, uint32_t topb, uint32_t window, float tau, float sink) {
+    return impl_->ersa_ivf_forward(q, k, v, heads, T, N, C, topb, window, tau, sink);
 }
 
 void ASM_ERSAModel::profile_stages(uint32_t t, uint32_t reps) {
