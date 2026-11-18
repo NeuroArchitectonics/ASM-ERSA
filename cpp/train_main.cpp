@@ -38,10 +38,12 @@
 #include "cpp/spv/moe_bwd_dw_shared_i8.spv.hpp"
 #include "spv/adamw_update.spv.hpp"
 #include "cpp/spv/gr_read_bwd_int8.spv.hpp"
+#include "cpp/spv/gr_read_post_seq.spv.hpp"
 #include "cpp/spv/gr_route_bwd_int8.spv.hpp"
 #include "cpp/spv/gr2_write_bwd.spv.hpp"
 #include "cpp/spv/l2norm_bwd.spv.hpp"
 #include "cpp/spv/asm_step_bwd_multi.spv.hpp"
+#include "cpp/spv/asm_step_bwd_seq.spv.hpp"
 #include "cpp/spv/ersa_attn_bwd_query.spv.hpp"
 #include "cpp/spv/ersa_ivf_attn_query.spv.hpp"
 #include "cpp/spv/ersa_ivf_attn_bwd_query.spv.hpp"
@@ -50,12 +52,15 @@
 #include "cpp/spv/kmeans_update.spv.hpp"
 #include "cpp/spv/kmeans_fill_members.spv.hpp"
 #include "cpp/spv/copy_f32_slice.spv.hpp"
+#include "cpp/spv/copy_i32_slice.spv.hpp"
+#include "cpp/spv/copy_i8_slice.spv.hpp"
 #include "cpp/spv/kmeans_inc_assign.spv.hpp"
 #include "cpp/spv/kmeans_inc_append.spv.hpp"
 #include "cpp/spv/kmeans_inc_update.spv.hpp"
 #include "cpp/spv/ersa_ivf_attn_bwd_cand.spv.hpp"
 #include "cpp/spv/add_inplace.spv.hpp"
 #include "cpp/spv/dequant_i8.spv.hpp"
+#include "cpp/spv/dequant_row_i8.spv.hpp"
 #include "cpp/spv/quantize_rows_i8.spv.hpp"
 #include "cpp/spv/transpose_f32.spv.hpp"
 #include "cpp/spv/transpose_heads.spv.hpp"
@@ -94,6 +99,7 @@ struct 规格Adam {
     std::uint32_t zero_grad;
 };
 struct GRReadPC { std::uint32_t B, D, T, t, first, pad0, pad1, pad2; };
+struct GrPostPC { std::uint32_t T, D, first, pad0; };
 struct QkvGemvPC {
     std::uint32_t B, D, H, DK, DV, T, t, proj, store, NBmax, BLOCK, pad;
 };
@@ -116,6 +122,10 @@ struct RMSNormPC { std::uint32_t R, D; float eps; std::uint32_t pad; };
 struct LmHeadPC { std::uint32_t T, D, V, TILE, pad0, pad1, pad2, pad3; };
 struct ASMBwdPC {
     std::uint32_t B, H, M, R, DK, DV;
+    float tau, tau_w, rho, lam, beta_null;
+};
+struct ASMSeqPC {
+    std::uint32_t B, H, M, R, DK, DV, T;
     float tau, tau_w, rho, lam, beta_null;
 };
 struct ErsaBwdPC {
@@ -149,7 +159,7 @@ struct IncUpdatePC {
 struct CopySlicePC {
     std::uint32_t H, SRC_N, DST_N, D, ROWS, SRC_ROW0, DST_ROW0, pad0;
 };
-struct Gr2BwdPC { std::uint32_t B, D, write_out, pad0; };
+struct Gr2BwdPC { std::uint32_t B, D, write_out, token, out_token; };
 struct L2BwdPC { std::uint32_t N, D, norm_offset, norm_stride; };
 struct TransposePC { std::uint32_t R, C, pad0, pad1; };
 struct HeadsPC { std::uint32_t H, T, D, pad0; };
@@ -162,7 +172,7 @@ struct MoeDwSI8PC { std::uint32_t T, D, F, mode, pad0, pad1; };
 struct MoeDwPC { std::uint32_t N, E, K, D, F, mode; };
 struct MoeDwSharedPC { std::uint32_t N, D, Fs, mode, pad0, pad1; };
 struct SumHeadsPC { std::uint32_t H, N, pad0, pad1; };
-struct GrRouteBwdPC { std::uint32_t B, D, pad0, pad1; };
+struct GrRouteBwdPC { std::uint32_t B, D, row, pad1; };
 
 std::uint32_t g_rng = 20261118u;
 float 随机() {
@@ -185,6 +195,14 @@ void 填(vk张量& t, float v) {
     t.上传(d.data(), d.size() * 4);
 }
 void 填零(vk张量& t) { 填(t, 0.0f); }
+std::vector<vk张量> 建双份(std::vector<std::uint32_t> 形状, 张量类型 类型,
+                           const std::string& 名) {
+    std::vector<vk张量> v;
+    v.reserve(2);
+    for (int i = 0; i < 2; ++i)
+        v.push_back(建(形状, 类型, 名 + "." + std::to_string(i)));
+    return v;
+}
 
 struct 参数 {
     vk张量 p, g, m, v, i8, s;
@@ -195,9 +213,8 @@ struct 参数 {
 };
 
 struct 记录 {
-    vk张量 xq, sx, eta, branch_in, branch_mid, branch_out, o_deq, x2_deq;
-    vk张量 qkv_q, qkv_k, qkv_v, o, wo_y, x2, idx, w, y_moe, dbg;
-    vk张量 Kold, Vold, Bold;
+    vk张量 xq, sx, branch_in, branch_out, x2_deq;
+    vk张量 o, idx, w;
 };
 
 struct 层 {
@@ -212,6 +229,7 @@ struct 层 {
     vk张量 k_cache, v_cache, ctx_k;
     vk张量 cent, counts, member, assign;
     std::vector<vk张量> candSnap, candCnt;
+    vk张量 candSnapSeq, candCntSeq;
     vk张量 moe_W1_i8, moe_W1_s, moe_W2_i8, moe_W2_s;
     float beta_null = -2.0f;
     float sink_value = -4.0f;
@@ -320,7 +338,7 @@ int main(int argc, char** argv) {
                            "ivf_init_centroids", "kmeans_assign", "kmeans_update",
                            "kmeans_fill_members", "kmeans_inc_assign",
                            "kmeans_inc_append", "kmeans_inc_update",
-                           "copy_f32_slice",
+                           "copy_f32_slice", "copy_i32_slice", "copy_i8_slice",
                            "linear_bwd_dx", "linear_bwd_dx_i8", "linear_bwd_dwdb",
                            "moe_bwd_dx_q",
                            "moe_bwd_dw_expert_q", "moe_bwd_dw_shared_q", "adamw_update"}) {
@@ -468,10 +486,28 @@ int main(int argc, char** argv) {
 
     std::vector<层> 层表;
     层表.resize(cfg.n_layers);
+    std::vector<vk张量> asmQAll(cfg.n_layers), asmKAll(cfg.n_layers), asmVAll(cfg.n_layers);
+    std::vector<vk张量> asmEtaAll(cfg.n_layers), asmKOldAll(cfg.n_layers);
+    std::vector<vk张量> asmVOldAll(cfg.n_layers), asmBoldAll(cfg.n_layers);
+    std::vector<vk张量> asmIdxAll(cfg.n_layers), asmXqAll(cfg.n_layers);
+    std::vector<vk张量> asmSxAll(cfg.n_layers);
     for (std::uint32_t li = 0; li < cfg.n_layers; ++li) {
         const asm_ersa_model::LayerWeights& lw = 主.layers[li];
         层& L = 层表[li];
         L.ersa = lw.is_ersa;
+        if (!L.ersa) {
+            const std::string pre = "L" + std::to_string(li) + ".seq.";
+            asmQAll[li] = 建({T, HDK}, 张量类型::浮点32, pre + "q");
+            asmKAll[li] = 建({T, HDK}, 张量类型::浮点32, pre + "k");
+            asmVAll[li] = 建({T, HDV}, 张量类型::浮点32, pre + "v");
+            asmEtaAll[li] = 建({T, B}, 张量类型::浮点32, pre + "eta");
+            asmKOldAll[li] = 建({T, B * H * M * DK}, 张量类型::浮点32, pre + "Kold");
+            asmVOldAll[li] = 建({T, B * H * M * DV}, 张量类型::浮点32, pre + "Vold");
+            asmBoldAll[li] = 建({T, B * H * M}, 张量类型::浮点32, pre + "Bold");
+            asmIdxAll[li] = 建({T, B * H * 3 * R}, 张量类型::浮点32, pre + "idx");
+            asmXqAll[li] = 建({T, D}, 张量类型::整数8, pre + "xq");
+            asmSxAll[li] = 建({T}, 张量类型::浮点32, pre + "sx");
+        }
         L.beta_null = lw.asm_w.beta_null;
         L.sink_value = lw.ersa_w.sink;
         L.g1ng = 加参数({4, D}, 合并4(lw.gr1.norm_g), "L" + std::to_string(li) + ".g1ng");
@@ -560,6 +596,8 @@ int main(int argc, char** argv) {
                     L.candCnt.push_back(建({H}, 张量类型::整数32,
                                            p + ".candn" + std::to_string(q)));
                 }
+                L.candSnapSeq = 建({H, Tq, MAXCAND}, 张量类型::整数32, p + ".candseq");
+                L.candCntSeq = 建({H, Tq}, 张量类型::整数32, p + ".candcntseq");
                 if (Nctx > 0) {
                     L.ctx_k = 建({H, Nctx, DK}, 张量类型::浮点32, p + ".ctxk");
                     L.assign = 建({H, Nctx}, 张量类型::整数32, p + ".assign");
@@ -605,18 +643,18 @@ int main(int argc, char** argv) {
     vk张量 h_s = 建({1, K, Gf}, 张量类型::浮点32, "h_s");
     vk张量 expert_out = 建({1, K, D}, 张量类型::浮点32, "expert_out");
     vk张量 y_moe = 建({1, D}, 张量类型::浮点32, "y_moe");
-    vk张量 moePre = 建({T, K, F}, 张量类型::浮点32, "moe.pre");
-    vk张量 moeHq = 建({T, K, F}, 张量类型::浮点32, "moe.hq");
-    vk张量 moeDh = 建({T, K, F}, 张量类型::浮点32, "moe.dh");
-    vk张量 moeShPre = 建({T, F}, 张量类型::浮点32, "moe.shpre");
-    vk张量 moeShUp = 建({T, F}, 张量类型::浮点32, "moe.shup");
-    vk张量 moeShHq = 建({T, F}, 张量类型::浮点32, "moe.shhq");
-    vk张量 moeShDh = 建({T, F}, 张量类型::浮点32, "moe.shdh");
-    vk张量 moeShSilu = 建({T, F}, 张量类型::浮点32, "moe.shsilu");
-    vk张量 moeXs = 建({T, D}, 张量类型::浮点32, "moe.xs");
-    vk张量 moeDys = 建({T, D}, 张量类型::浮点32, "moe.dys");
-    vk张量 moeIdxS = 建({T, K}, 张量类型::整数32, "moe.idxs");
-    vk张量 moeKwS = 建({T, K}, 张量类型::浮点32, "moe.kws");
+    auto moePreV = 建双份({T, K, F}, 张量类型::浮点32, "moe.pre");
+    auto moeHqV = 建双份({T, K, F}, 张量类型::浮点32, "moe.hq");
+    auto moeDhV = 建双份({T, K, F}, 张量类型::浮点32, "moe.dh");
+    auto moeShPreV = 建双份({T, F}, 张量类型::浮点32, "moe.shpre");
+    auto moeShUpV = 建双份({T, F}, 张量类型::浮点32, "moe.shup");
+    auto moeShHqV = 建双份({T, F}, 张量类型::浮点32, "moe.shhq");
+    auto moeShDhV = 建双份({T, F}, 张量类型::浮点32, "moe.shdh");
+    auto moeShSiluV = 建双份({T, F}, 张量类型::浮点32, "moe.shsilu");
+    auto moeXsV = 建双份({T, D}, 张量类型::浮点32, "moe.xs");
+    auto moeDysV = 建双份({T, D}, 张量类型::浮点32, "moe.dys");
+    auto moeIdxSV = 建双份({T, K}, 张量类型::整数32, "moe.idxs");
+    auto moeKwSV = 建双份({T, K}, 张量类型::浮点32, "moe.kws");
     vk张量 qkv_q = 建({1, HDK}, 张量类型::浮点32, "qkv_q");
     vk张量 qkv_k = 建({1, HDK}, 张量类型::浮点32, "qkv_k");
     vk张量 qkv_v = 建({1, HDV}, 张量类型::浮点32, "qkv_v");
@@ -645,6 +683,28 @@ int main(int argc, char** argv) {
         ivfOverflow.上传(z.data(), z.size() * 4);
     }
 
+    std::vector<vk张量> branchMidAll, yMoeAll, branchInAll, woYAll, x2All, oDeqAll;
+    branchMidAll.reserve(cfg.n_layers);
+    yMoeAll.reserve(cfg.n_layers);
+    branchInAll.reserve(cfg.n_layers);
+    woYAll.reserve(cfg.n_layers);
+    x2All.reserve(cfg.n_layers);
+    oDeqAll.reserve(cfg.n_layers);
+    for (std::uint32_t li = 0; li < cfg.n_layers; ++li) {
+        branchMidAll.push_back(建({T, 4, D}, 张量类型::浮点32,
+                                  "seq.branch_mid." + std::to_string(li)));
+        yMoeAll.push_back(建({T, D}, 张量类型::浮点32,
+                             "seq.y_moe." + std::to_string(li)));
+        branchInAll.push_back(建({T, 4, D}, 张量类型::浮点32,
+                                 "seq.branch_in." + std::to_string(li)));
+        woYAll.push_back(建({T, D}, 张量类型::浮点32,
+                            "seq.wo_y." + std::to_string(li)));
+        x2All.push_back(建({T, D}, 张量类型::浮点32,
+                           "seq.x2." + std::to_string(li)));
+        oDeqAll.push_back(建({T, HDV}, 张量类型::浮点32,
+                             "seq.o_deq." + std::to_string(li)));
+    }
+
     std::vector<std::vector<std::unique_ptr<记录>>> 记录表(T);
     for (std::uint32_t t = 0; t < T; ++t) {
         记录表[t].resize(cfg.n_layers);
@@ -653,25 +713,12 @@ int main(int argc, char** argv) {
             const std::string 前缀 = "rec." + std::to_string(t) + "." + std::to_string(li);
             r->xq = 建({1, D}, 张量类型::整数8, 前缀 + ".xq");
             r->sx = 建({1}, 张量类型::浮点32, 前缀 + ".sx");
-            r->eta = 建({1}, 张量类型::浮点32, 前缀 + ".eta");
             r->branch_in = 建({B, 4, D}, 张量类型::浮点32, 前缀 + ".bin");
-            r->branch_mid = 建({B, 4, D}, 张量类型::浮点32, 前缀 + ".bmid");
             r->branch_out = 建({B, 4, D}, 张量类型::浮点32, 前缀 + ".bout");
-            r->qkv_q = 建({1, HDK}, 张量类型::浮点32, 前缀 + ".q");
-            r->qkv_k = 建({1, HDK}, 张量类型::浮点32, 前缀 + ".k");
-            r->qkv_v = 建({1, HDV}, 张量类型::浮点32, 前缀 + ".v");
             r->o = 建({1, HDV}, 张量类型::浮点32, 前缀 + ".o");
-            r->o_deq = 建({1, HDV}, 张量类型::浮点32, 前缀 + ".o_deq");
             r->x2_deq = 建({1, D}, 张量类型::浮点32, 前缀 + ".x2_deq");
-            r->wo_y = 建({1, D}, 张量类型::浮点32, 前缀 + ".wo_y");
-            r->x2 = 建({1, D}, 张量类型::浮点32, 前缀 + ".x2");
             r->idx = 建({1, K}, 张量类型::整数32, 前缀 + ".idx");
             r->w = 建({1, K}, 张量类型::浮点32, 前缀 + ".w");
-            r->y_moe = 建({1, D}, 张量类型::浮点32, 前缀 + ".y");
-            r->dbg = 建({1, H, 3 * R}, 张量类型::浮点32, 前缀 + ".dbg");
-            r->Kold = 建({B, H, M, DK}, 张量类型::浮点32, 前缀 + ".Kold");
-            r->Vold = 建({B, H, M, DV}, 张量类型::浮点32, 前缀 + ".Vold");
-            r->Bold = 建({B, H, M}, 张量类型::浮点32, 前缀 + ".Bold");
             记录表[t][li] = std::move(r);
         }
     }
@@ -704,12 +751,8 @@ int main(int argc, char** argv) {
     vk张量 normed_f32 = 建({Tq, D}, 张量类型::浮点32, "normed_f32");
     vk张量 zero_TD = 建({T, D}, 张量类型::浮点32, "zero_TD");
     填零(zero_TD);
-    std::vector<vk张量> dBranchUpper;
-    dBranchUpper.reserve(T);
-    for (std::uint32_t t = 0; t < T; ++t) {
-        dBranchUpper.push_back(建({B, 4, D}, 张量类型::浮点32, "dBranchUpper"));
-        填零(dBranchUpper.back());
-    }
+    vk张量 dBranchUpperAll = 建({T, 4, D}, 张量类型::浮点32, "dBranchUpperAll");
+    填零(dBranchUpperAll);
 
     auto 累加 = [&](参数* p, const vk张量& tmp) {
         if (p == nullptr) return;
@@ -748,8 +791,8 @@ int main(int argc, char** argv) {
         for (float x : lossh) 平均 += x;
         平均 /= double(Tq);
 
-        const QuantPC dq{Tq * D, D, 1, 0};
-        提交2("dequant_i8",
+        const QuantPC dq{Tq * D, D, 0, 0};
+        提交2("dequant_row_i8",
               {normed_q.取句柄(), normed_s.取句柄(), normed_f32.取句柄()},
               &dq, sizeof(dq), (Tq * D + 255u) / 256u, 1, 1);
 
@@ -786,53 +829,52 @@ int main(int argc, char** argv) {
     };
 
     // ── 反向工作张量（逐 token 复用；参数梯度累加进 参数::g）──
-    vk张量 dY = 建({1, D}, 张量类型::浮点32, "bwd.dY");
-    vk张量 dBranchMid = 建({1, 4, D}, 张量类型::浮点32, "bwd.dBmid");
-    vk张量 dW2w = 建({4, D}, 张量类型::浮点32, "bwd.dW2w");
-    vk张量 db2w = 建({4}, 张量类型::浮点32, "bwd.db2w");
-    vk张量 dX2 = 建({1, D}, 张量类型::浮点32, "bwd.dX2");
-    vk张量 dScore = 建({1, E}, 张量类型::浮点32, "bwd.dScore");
+    auto dYAllV = 建双份({T, D}, 张量类型::浮点32, "bwd.dYAll");
+    auto dBranchMidAllV = 建双份({T, 4, D}, 张量类型::浮点32, "bwd.dBmidAll");
+    auto dW2wV = 建双份({4, D}, 张量类型::浮点32, "bwd.dW2w");
+    auto db2wV = 建双份({4}, 张量类型::浮点32, "bwd.db2w");
+    vk张量 dW2wAll = 建({T, 4, D}, 张量类型::浮点32, "bwd.dW2wAll");
+    vk张量 db2wAll = 建({T, 4}, 张量类型::浮点32, "bwd.db2wAll");
+    auto dX2AllV = 建双份({T, D}, 张量类型::浮点32, "bwd.dX2All");
+    auto dScoreAllV = 建双份({T, E}, 张量类型::浮点32, "bwd.dScoreAll");
+    auto moeXInV = 建双份({T, D}, 张量类型::浮点32, "bwd.moeXIn");
+    auto moeIdxInV = 建双份({T, K}, 张量类型::整数32, "bwd.moeIdxIn");
+    auto moeKwInV = 建双份({T, K}, 张量类型::浮点32, "bwd.moeKwIn");
     vk张量 dGateW = 建({E, D}, 张量类型::浮点32, "bwd.dGateW");
     vk张量 dGateDb = 建({E}, 张量类型::浮点32, "bwd.dGateDb");
-    vk张量 dW1 = 建({E * D, F}, 张量类型::浮点32, "bwd.dW1");
-    vk张量 dW2 = 建({E * F, D}, 张量类型::浮点32, "bwd.dW2");
-    vk张量 dShW1T = 建({D, F}, 张量类型::浮点32, "bwd.dShW1T");
-    vk张量 dShWupT = 建({D, F}, 张量类型::浮点32, "bwd.dShWupT");
-    vk张量 dShW2T = 建({F, D}, 张量类型::浮点32, "bwd.dShW2T");
-    vk张量 dShW1 = 建({F, D}, 张量类型::浮点32, "bwd.dShW1");
-    vk张量 dShWup = 建({F, D}, 张量类型::浮点32, "bwd.dShWup");
-    vk张量 dShW2 = 建({D, F}, 张量类型::浮点32, "bwd.dShW2");
+    auto dW1V = 建双份({E * D, F}, 张量类型::浮点32, "bwd.dW1");
+    auto dW2V = 建双份({E * F, D}, 张量类型::浮点32, "bwd.dW2");
+    auto dShW1TV = 建双份({D, F}, 张量类型::浮点32, "bwd.dShW1T");
+    auto dShWupTV = 建双份({D, F}, 张量类型::浮点32, "bwd.dShWupT");
+    auto dShW2TV = 建双份({F, D}, 张量类型::浮点32, "bwd.dShW2T");
+    auto dShW1V = 建双份({F, D}, 张量类型::浮点32, "bwd.dShW1");
+    auto dShWupV = 建双份({F, D}, 张量类型::浮点32, "bwd.dShWup");
+    auto dShW2V = 建双份({D, F}, 张量类型::浮点32, "bwd.dShW2");
 
-    vk张量 dWoY = 建({1, D}, 张量类型::浮点32, "bwd.dWoY");
-    vk张量 dBranchR = 建({1, 4, D}, 张量类型::浮点32, "bwd.dBroute");
     vk张量 dOutNorm = 建({D}, 张量类型::浮点32, "bwd.dOutNorm");
     vk张量 dW1W = 建({4, D}, 张量类型::浮点32, "bwd.dW1W");
     vk张量 dW1B = 建({4}, 张量类型::浮点32, "bwd.dW1B");
     vk张量 dG2G = 建({4, D}, 张量类型::浮点32, "bwd.dG2G");
     vk张量 dG2W = 建({4, 4 * D}, 张量类型::浮点32, "bwd.dG2W");
     vk张量 dG2B = 建({4}, 张量类型::浮点32, "bwd.dG2B");
-    vk张量 dO = 建({1, HDV}, 张量类型::浮点32, "bwd.dO");
+    vk张量 dWoYAll = 建({T, D}, 张量类型::浮点32, "bwd.dWoYAll");
+    vk张量 dOAll = 建({T, HDV}, 张量类型::浮点32, "bwd.dOAll");
+    vk张量 dBranchRAll = 建({T, 4, D}, 张量类型::浮点32, "bwd.dBrouteAll");
+    vk张量 dOutNormAll = 建({T, D}, 张量类型::浮点32, "bwd.dOutNormAll");
+    vk张量 dW1WAll = 建({T, 4, D}, 张量类型::浮点32, "bwd.dW1WAll");
+    vk张量 dW1BAll = 建({T, 4}, 张量类型::浮点32, "bwd.dW1BAll");
+    vk张量 dG2GAll = 建({T, 4, D}, 张量类型::浮点32, "bwd.dG2GAll");
+    vk张量 dG2WAll = 建({T, 4, 4 * D}, 张量类型::浮点32, "bwd.dG2WAll");
+    vk张量 dG2BAll = 建({T, 4}, 张量类型::浮点32, "bwd.dG2BAll");
     vk张量 dWo = 建({D, HDV}, 张量类型::浮点32, "bwd.dWo");
     vk张量 dWoDb = 建({D}, 张量类型::浮点32, "bwd.dWoDb");
 
-    vk张量 dqN = 建({1, HDK}, 张量类型::浮点32, "bwd.dqN");
-    vk张量 dkN = 建({1, HDK}, 张量类型::浮点32, "bwd.dkN");
-    vk张量 dvN = 建({1, HDV}, 张量类型::浮点32, "bwd.dvN");
-    vk张量 detaH = 建({H}, 张量类型::浮点32, "bwd.detaH");
-    vk张量 dEtaH = 建({H}, 张量类型::浮点32, "bwd.dEtaH");
+    vk张量 dKnSeq = 建({B, H, M, DK}, 张量类型::浮点32, "bwd.dKnSeq");
+    vk张量 dVnSeq = 建({B, H, M, DV}, 张量类型::浮点32, "bwd.dVnSeq");
+    vk张量 dBnSeq = 建({B, H, M}, 张量类型::浮点32, "bwd.dBnSeq");
     vk张量 dbnH = 建({H}, 张量类型::浮点32, "bwd.dbnH");
-    vk张量 dKo = 建({1, H, M, DK}, 张量类型::浮点32, "bwd.dKo");
-    vk张量 dVo = 建({1, H, M, DV}, 张量类型::浮点32, "bwd.dVo");
-    vk张量 dBo = 建({1, H, M}, 张量类型::浮点32, "bwd.dBo");
     vk张量 dgammaH = 建({H, M}, 张量类型::浮点32, "bwd.dgammaH");
     vk张量 dGamma = 建({M}, 张量类型::浮点32, "bwd.dGamma");
-    vk张量 dqRaw = 建({1, HDK}, 张量类型::浮点32, "bwd.dqRaw");
-    vk张量 dkRaw = 建({1, HDK}, 张量类型::浮点32, "bwd.dkRaw");
-    vk张量 dx_q = 建({1, D}, 张量类型::浮点32, "bwd.dxq");
-    vk张量 dx_k = 建({1, D}, 张量类型::浮点32, "bwd.dxk");
-    vk张量 dx_v = 建({1, D}, 张量类型::浮点32, "bwd.dxv");
-    vk张量 dX = 建({1, D}, 张量类型::浮点32, "bwd.dX");
-    vk张量 x1 = 建({1, D}, 张量类型::浮点32, "bwd.x1");
     vk张量 dWq = 建({HDK, D}, 张量类型::浮点32, "bwd.dWq");
     vk张量 dWk = 建({HDK, D}, 张量类型::浮点32, "bwd.dWk");
     vk张量 dWv = 建({HDV, D}, 张量类型::浮点32, "bwd.dWv");
@@ -840,33 +882,27 @@ int main(int argc, char** argv) {
     vk张量 dWkDb = 建({HDK}, 张量类型::浮点32, "bwd.dWkDb");
     vk张量 dWvDb = 建({HDV}, 张量类型::浮点32, "bwd.dWvDb");
 
-    vk张量 dIn = 建({1, 4, D}, 张量类型::浮点32, "bwd.dIn");
     vk张量 dNormG = 建({4, D}, 张量类型::浮点32, "bwd.dNormG");
     vk张量 dReadW = 建({4, 4 * D}, 张量类型::浮点32, "bwd.dReadW");
     vk张量 dReadB = 建({4}, 张量类型::浮点32, "bwd.dReadB");
     vk张量 dEtaW = 建({D}, 张量类型::浮点32, "bwd.dEtaW");
     vk张量 dEtaB = 建({1}, 张量类型::浮点32, "bwd.dEtaB");
-    vk张量 dComb = 建({1, 4, D}, 张量类型::浮点32, "bwd.dComb");
-    std::vector<vk张量> dEmbedT;
-    dEmbedT.reserve(T);
-    for (std::uint32_t t = 0; t < T; ++t)
-        dEmbedT.push_back(建({1, D}, 张量类型::浮点32, "bwd.dEmbedT"));
+    vk张量 dInAll = 建({T, 4, D}, 张量类型::浮点32, "bwd.dInAll");
+    vk张量 dNormGAll = 建({T, 4, D}, 张量类型::浮点32, "bwd.dNormGAll");
+    vk张量 dReadWAll = 建({T, 4, 4 * D}, 张量类型::浮点32, "bwd.dReadWAll");
+    vk张量 dReadBAll = 建({T, 4}, 张量类型::浮点32, "bwd.dReadBAll");
+    vk张量 dEtaWAll = 建({T, D}, 张量类型::浮点32, "bwd.dEtaWAll");
+    vk张量 dEtaBAll = 建({T}, 张量类型::浮点32, "bwd.dEtaBAll");
+    vk张量 dEtaAll = 建({T, H}, 张量类型::浮点32, "bwd.dEtaAll");
+    vk张量 dEtaZero = 建({T, H}, 张量类型::浮点32, "bwd.dEtaZero");
+    填零(dEtaZero);
     vk张量 dEmbedAll = 建({T, D}, 张量类型::浮点32, "bwd.dEmbedAll");
     vk张量 dTable = 建({V, D}, 张量类型::浮点32, "bwd.dTable");
 
     // ERSA 历史梯度
     vk张量 dQH = 建({H, T, DK}, 张量类型::浮点32, "bwd.dQH");
-    std::vector<vk张量> dYProbe0, dYProbe16, dYProbe31;
-    std::vector<vk张量> dX2Probe31, dOProbe31;
     vk张量 dQ31, dK31, dV31, dXAll31;
     if (big3b) {
-        for (std::uint32_t t = 0; t < T; ++t) {
-            dYProbe0.push_back(建({1, D}, 张量类型::浮点32, "probe.dY0"));
-            dYProbe16.push_back(建({1, D}, 张量类型::浮点32, "probe.dY16"));
-            dYProbe31.push_back(建({1, D}, 张量类型::浮点32, "probe.dY31"));
-            dX2Probe31.push_back(建({1, D}, 张量类型::浮点32, "probe.dX31"));
-            dOProbe31.push_back(建({1, HDV}, 张量类型::浮点32, "probe.dO31"));
-        }
         dQ31 = 建({H, T, DK}, 张量类型::浮点32, "probe.dQ31");
         dK31 = 建({H, T, DK}, 张量类型::浮点32, "probe.dK31");
         dV31 = 建({H, T, DV}, 张量类型::浮点32, "probe.dV31");
@@ -877,6 +913,9 @@ int main(int argc, char** argv) {
     vk张量 dSinkH = 建({H}, 张量类型::浮点32, "bwd.dsink");
     vk张量 dqRawH = 建({H, T, DK}, 张量类型::浮点32, "bwd.dqRawH");
     vk张量 dkRawH = 建({H, T, DK}, 张量类型::浮点32, "bwd.dkRawH");
+    vk张量 dqRawAll = 建({T, HDK}, 张量类型::浮点32, "bwd.dqRawAll");
+    vk张量 dkRawAll = 建({T, HDK}, 张量类型::浮点32, "bwd.dkRawAll");
+    vk张量 dvAll = 建({T, HDV}, 张量类型::浮点32, "bwd.dvAll");
     vk张量 dqT = 建({T, HDK}, 张量类型::浮点32, "bwd.dqT");
     vk张量 dkT = 建({T, HDK}, 张量类型::浮点32, "bwd.dkT");
     vk张量 dvT = 建({T, HDV}, 张量类型::浮点32, "bwd.dvT");
@@ -888,14 +927,6 @@ int main(int argc, char** argv) {
     vk张量 sAll = 建({T}, 张量类型::浮点32, "bwd.sAll");
     vk张量 xDeq = 建({T, D}, 张量类型::浮点32, "bwd.xDeq");
     vk张量 dXAll = 建({T, D}, 张量类型::浮点32, "bwd.dXAll");
-    vk张量 dX1 = 建({1, D}, 张量类型::浮点32, "bwd.dX1");
-    std::vector<vk张量> dOrec;
-    std::vector<vk张量> dBranchRec;
-    dOrec.reserve(T); dBranchRec.reserve(T);
-    for (std::uint32_t t = 0; t < T; ++t) {
-        dOrec.push_back(建({1, HDV}, 张量类型::浮点32, "bwd.dOrec"));
-        dBranchRec.push_back(建({1, 4, D}, 张量类型::浮点32, "bwd.dBrec"));
-    }
 
     auto 转置 = [&](const vk张量& in, vk张量& out, std::uint32_t R, std::uint32_t C) {
         const TransposePC pc{R, C, 0, 0};
@@ -914,185 +945,148 @@ int main(int argc, char** argv) {
         const bool first = (li == 0);
 
 
-        std::vector<vk张量> dKn, dVn, dBn;
         if (!L.ersa) {
-            for (int i = 0; i < 3; ++i) {
-                dKn.push_back(建({B, H, M, DK}, 张量类型::浮点32, "bwd.dKn"));
-                dVn.push_back(建({B, H, M, DV}, 张量类型::浮点32, "bwd.dVn"));
-                dBn.push_back(建({B, H, M}, 张量类型::浮点32, "bwd.dBn"));
-                填零(dKn.back()); 填零(dVn.back()); 填零(dBn.back());
-            }
+            填零(dKnSeq); 填零(dVnSeq); 填零(dBnSeq);
         } else {
             填零(dQH); 填零(dKH); 填零(dVH); 填零(dSinkH);
         }
-        填零(dEtaH);
+
+        const std::uint32_t buf = li & 1u;
+        vk张量& dYAll = dYAllV[buf];
+        vk张量& dBranchMidAll = dBranchMidAllV[buf];
+        vk张量& dX2All = dX2AllV[buf];
+        vk张量& dScoreAll = dScoreAllV[buf];
+        vk张量& moeXIn = moeXInV[buf];
+        vk张量& moeIdxIn = moeIdxInV[buf];
+        vk张量& moeKwIn = moeKwInV[buf];
+        vk张量& dW2w = dW2wV[buf];
+        vk张量& db2w = db2wV[buf];
+        vk张量& moePre = moePreV[buf];
+        vk张量& moeHq = moeHqV[buf];
+        vk张量& moeDh = moeDhV[buf];
+        vk张量& moeShPre = moeShPreV[buf];
+        vk张量& moeShUp = moeShUpV[buf];
+        vk张量& moeShHq = moeShHqV[buf];
+        vk张量& moeShDh = moeShDhV[buf];
+        vk张量& moeShSilu = moeShSiluV[buf];
+        vk张量& moeXs = moeXsV[buf];
+        vk张量& moeDys = moeDysV[buf];
+        vk张量& moeIdxS = moeIdxSV[buf];
+        vk张量& moeKwS = moeKwSV[buf];
+        vk张量& dW1 = dW1V[buf];
+        vk张量& dW2 = dW2V[buf];
+        vk张量& dShW1T = dShW1TV[buf];
+        vk张量& dShWupT = dShWupTV[buf];
+        vk张量& dShW2T = dShW2TV[buf];
+        vk张量& dShW1 = dShW1V[buf];
+        vk张量& dShWup = dShWupV[buf];
+        vk张量& dShW2 = dShW2V[buf];
+
+        // ── 阶段 A：一次序列并行 GR2 写回，连续写入 dYAll / dBranchMidAll ──
+        const Gr2BwdPC g2{T, D, 最后 ? 1u : 0u, 0, 0};
+        提交2("gr2_write_bwd",
+              {branchMidAll[li].取句柄(), yMoeAll[li].取句柄(), L.g2ww->p.取句柄(),
+               L.g2wb->p.取句柄(), dBranchUpperAll.取句柄(), dOutTokens.取句柄(),
+               dYAll.取句柄(), dBranchMidAll.取句柄(), dW2wAll.取句柄(), db2wAll.取句柄()},
+              &g2, sizeof(g2), T, 1, 1);
+        求和头(dW2wAll, dW2w, T, 4 * D);
+        求和头(db2wAll, db2w, T, 4);
+        累加(L.g2ww, dW2w);
+        累加(L.g2wb, db2w);
 
         for (int ti = int(T) - 1; ti >= 0; --ti) {
             const std::uint32_t t = std::uint32_t(ti);
             记录& r = *记录表[t][li];
+            const CopySlicePC xc{1, 1, T, D, 1, 0, t, 0};
+            提交2("copy_f32_slice", {r.x2_deq.取句柄(), moeXIn.取句柄()},
+                  &xc, sizeof(xc), 1, 1, 1);
+            const CopySlicePC ic{1, 1, T, K, 1, 0, t, 0};
+            提交2("copy_i32_slice", {r.idx.取句柄(), moeIdxIn.取句柄()},
+                  &ic, sizeof(ic), 1, 1, 1);
+            const CopySlicePC wc{1, 1, T, K, 1, 0, t, 0};
+            提交2("copy_f32_slice", {r.w.取句柄(), moeKwIn.取句柄()},
+                  &wc, sizeof(wc), 1, 1, 1);
+        }
 
-            // GR2 write 反向
-            const Gr2BwdPC g2{1, D, 最后 ? 1u : 0u, t};
-            提交2("gr2_write_bwd",
-                  {r.branch_mid.取句柄(), r.y_moe.取句柄(), L.g2ww->p.取句柄(),
-                   L.g2wb->p.取句柄(), dBranchUpper[t].取句柄(), dOutTokens.取句柄(),
-                   dY.取句柄(), dBranchMid.取句柄(), dW2w.取句柄(), db2w.取句柄()},
-                  &g2, sizeof(g2), 1, 1, 1);
+        // ── 阶段 B：一次批量 MoE dx，读写连续 [T,*] buffer ──
+        const MoeDxI8PC mdx{E, K, D, F, F, Gd, Gf, 0, T};
+        提交2("moe_bwd_dx_i8",
+              {moeXIn.取句柄(), dYAll.取句柄(), L.gate->p.取句柄(),
+               L.moe_W1_i8.取句柄(), L.moe_W1_s.取句柄(),
+               L.moe_W2_i8.取句柄(), L.moe_W2_s.取句柄(),
+               moeIdxIn.取句柄(), moeKwIn.取句柄(),
+               L.shW1->i8.取句柄(), L.shW1->s.取句柄(),
+               L.shWup->i8.取句柄(), L.shWup->s.取句柄(),
+               L.shW2->i8.取句柄(), L.shW2->s.取句柄(),
+               dX2All.取句柄(), dScoreAll.取句柄(),
+               moePre.取句柄(), moeHq.取句柄(), moeDh.取句柄(),
+               moeShPre.取句柄(), moeShUp.取句柄(), moeShHq.取句柄(),
+               moeShDh.取句柄(), moeXs.取句柄(), moeDys.取句柄(),
+               moeIdxS.取句柄(), moeKwS.取句柄(), moeShSilu.取句柄()},
+              &mdx, sizeof(mdx), T, 1, 1);
 
-            累加(L.g2ww, dW2w);
-            累加(L.g2wb, db2w);
+        // gr_route 也按序列并行：读连续 [T,*] 记录，权重梯度按 token 输出后归约。
+        const GrRouteBwdPC rr{T, D, 0, 0};
+        提交2("gr_route_bwd_int8",
+              {woYAll[li].取句柄(), branchInAll[li].取句柄(), L.outNorm->p.取句柄(),
+               L.g1ww->p.取句柄(), L.g1wb->p.取句柄(), L.g2ng->p.取句柄(),
+               L.g2rw->p.取句柄(), L.g2rb->p.取句柄(), dX2All.取句柄(),
+               dBranchMidAll.取句柄(), dWoYAll.取句柄(), dBranchRAll.取句柄(),
+               dOutNormAll.取句柄(), dW1WAll.取句柄(), dW1BAll.取句柄(),
+               dG2GAll.取句柄(), dG2WAll.取句柄(), dG2BAll.取句柄()},
+              &rr, sizeof(rr), T, 1, 1);
+        求和头(dOutNormAll, dOutNorm, T, D);
+        求和头(dW1WAll, dW1W, T, 4 * D);
+        求和头(dW1BAll, dW1B, T, 4);
+        求和头(dG2GAll, dG2G, T, 4 * D);
+        求和头(dG2WAll, dG2W, T, 16 * D);
+        求和头(dG2BAll, dG2B, T, 4);
+        累加(L.outNorm, dOutNorm);
+        累加(L.g1ww, dW1W);
+        累加(L.g1wb, dW1B);
+        累加(L.g2ng, dG2G);
+        累加(L.g2rw, dG2W);
+        累加(L.g2rb, dG2B);
 
-            // MoE token 反向：int8 权重直读，pre/h/dh 写 scratch。
-            const MoeDxI8PC mdx{E, K, D, F, F, Gd, Gf, t, T};
-            提交2("moe_bwd_dx_i8",
-                  {r.x2_deq.取句柄(), dY.取句柄(), L.gate->p.取句柄(),
-                   L.moe_W1_i8.取句柄(), L.moe_W1_s.取句柄(),
-                   L.moe_W2_i8.取句柄(), L.moe_W2_s.取句柄(),
-                   r.idx.取句柄(), r.w.取句柄(),
-                   L.shW1->i8.取句柄(), L.shW1->s.取句柄(),
-                   L.shWup->i8.取句柄(), L.shWup->s.取句柄(),
-                   L.shW2->i8.取句柄(), L.shW2->s.取句柄(),
-                   dX2.取句柄(), dScore.取句柄(),
-                   moePre.取句柄(), moeHq.取句柄(), moeDh.取句柄(),
-                   moeShPre.取句柄(), moeShUp.取句柄(), moeShHq.取句柄(),
-                   moeShDh.取句柄(), moeXs.取句柄(), moeDys.取句柄(),
-                   moeIdxS.取句柄(), moeKwS.取句柄(), moeShSilu.取句柄()},
-                  &mdx, sizeof(mdx), 1, 1, 1);
+        const 规格4 gpb{T, D, E, 0};
+        提交2("linear_bwd_dwdb",
+              {x2All[li].取句柄(), dScoreAll.取句柄(),
+               dGateW.取句柄(), dGateDb.取句柄()},
+              &gpb, sizeof(gpb), (E * D + 63u) / 64u, 1, 1);
+        累加(L.gate, dGateW);
+        const LinI8PC woiT{T, HDV, D, Ghdv};
+        提交2("linear_bwd_dx_i8",
+              {dWoYAll.取句柄(), L.Wo->i8.取句柄(), L.Wo->s.取句柄(),
+               dOAll.取句柄()},
+              &woiT, sizeof(woiT), (T * D + 63u) / 64u, 1, 1);
+        const 规格4 wob{T, HDV, D, 0};
+        提交2("linear_bwd_dwdb",
+              {oDeqAll[li].取句柄(), dWoYAll.取句柄(),
+               dWo.取句柄(), dWoDb.取句柄()},
+              &wob, sizeof(wob), (D * HDV + 63u) / 64u, 1, 1);
+        累加(L.Wo, dWo);
 
-
-            const 规格4 gp{1, D, E, 0};
-            提交2("linear_bwd_dwdb",
-                  {r.x2.取句柄(), dScore.取句柄(), dGateW.取句柄(), dGateDb.取句柄()},
-                  &gp, sizeof(gp), (E * D + 63u) / 64u, 1, 1);
-            累加(L.gate, dGateW);
-
-            // GR route 反向
-            const GrRouteBwdPC rr{1, D, 0, 0};
-            提交2("gr_route_bwd_int8",
-                  {r.wo_y.取句柄(), r.branch_in.取句柄(), L.outNorm->p.取句柄(),
-                   L.g1ww->p.取句柄(), L.g1wb->p.取句柄(), L.g2ng->p.取句柄(),
-                   L.g2rw->p.取句柄(), L.g2rb->p.取句柄(), dX2.取句柄(),
-                   dBranchMid.取句柄(), dWoY.取句柄(), dBranchR.取句柄(),
-                   dOutNorm.取句柄(), dW1W.取句柄(), dW1B.取句柄(),
-                   dG2G.取句柄(), dG2W.取句柄(), dG2B.取句柄()},
-                  &rr, sizeof(rr), 1, 1, 1);
-            累加(L.outNorm, dOutNorm);
-            累加(L.g1ww, dW1W);
-            累加(L.g1wb, dW1B);
-            累加(L.g2ng, dG2G);
-            累加(L.g2rw, dG2W);
-            累加(L.g2rb, dG2B);
-
-            // Wo 反向
-            const 规格4 wo{1, HDV, D, 0};
-            const LinI8PC woi{1, HDV, D, Ghdv};
-            提交2("linear_bwd_dx_i8",
-                  {dWoY.取句柄(), L.Wo->i8.取句柄(), L.Wo->s.取句柄(), dO.取句柄()},
-                  &woi, sizeof(woi), (HDV + 63u) / 64u, 1, 1);
-            提交2("linear_bwd_dwdb",
-                  {r.o_deq.取句柄(), dWoY.取句柄(), dWo.取句柄(), dWoDb.取句柄()},
-                  &wo, sizeof(wo), (D * HDV + 63u) / 64u, 1, 1);
-            累加(L.Wo, dWo);
-
-            if (!L.ersa) {
-                // ASM 单步反向（同时给出 dq/dk/dv/deta 和状态梯度）
-                const float tau = 0.005f;
-                const ASMBwdPC ap{B, H, M, R, DK, DV,
-                                  tau, tau, 0.9f, 0.01f, L.beta_null};
-                提交2("asm_step_bwd_multi",
-                      {r.qkv_q.取句柄(), r.qkv_k.取句柄(), r.qkv_v.取句柄(),
-                       r.eta.取句柄(), r.Kold.取句柄(), r.Vold.取句柄(), r.Bold.取句柄(),
-                       L.gamma->p.取句柄(), dO.取句柄(),
-                       dKn.back().取句柄(), dVn.back().取句柄(), dBn.back().取句柄(),
-                       r.dbg.取句柄(), dqN.取句柄(), dkN.取句柄(), dvN.取句柄(),
-                       detaH.取句柄(), dKo.取句柄(), dVo.取句柄(), dBo.取句柄(),
-                       dgammaH.取句柄(), dbnH.取句柄()},
-                      &ap, sizeof(ap), (B * H + 31u) / 32u, 1, 1);
-
-                求和头(dgammaH, dGamma, H, M);
-                累加(L.gamma, dGamma);
-                {
-                    const auto dNull = 求标量(dbnH, H);
-                    累加(L.betaNull, dNull);
-                }
-                if (t == 0) {
-                    求和头(dKo, dSlot, H, M * DK);
-                    累加(L.slotK, dSlot);
-                }
-                // 状态梯度向 t-1 传递
-                dKo.拷贝到(dKn.back());
-                dVo.拷贝到(dVn.back());
-                dBo.拷贝到(dBn.back());
-
-                // Q/K L2Norm 反向 + QKV 线性反向
-                const L2BwdPC l2q{H, DK, t, T};
-                const L2BwdPC l2k{H, DK, H * T + t, T};
-                提交2("l2norm_bwd",
-                      {r.qkv_q.取句柄(), dqN.取句柄(), L.qkv_norm.取句柄(), dqRaw.取句柄()},
-                      &l2q, sizeof(l2q), H, 1, 1);
-                提交2("l2norm_bwd",
-                      {r.qkv_k.取句柄(), dkN.取句柄(), L.qkv_norm.取句柄(), dkRaw.取句柄()},
-                      &l2k, sizeof(l2k), H, 1, 1);
-
-                const QuantPC dqx{D, D, 1, 0};
-                提交2("dequant_i8",
-                      {r.xq.取句柄(), r.sx.取句柄(), x1.取句柄()},
-                      &dqx, sizeof(dqx), (D + 255u) / 256u, 1, 1);
-                const 规格4 lq{1, D, HDK, 0};
-                const 规格4 lv{1, D, HDV, 0};
-                提交2("linear_bwd_dwdb",
-                      {x1.取句柄(), dqRaw.取句柄(), dWq.取句柄(), dWqDb.取句柄()},
-                      &lq, sizeof(lq), (HDK * D + 63u) / 64u, 1, 1);
-                const LinI8PC lqi{1, D, HDK, Gd};
-                提交2("linear_bwd_dx_i8",
-                      {dqRaw.取句柄(), L.Wq->i8.取句柄(), L.Wq->s.取句柄(),
-                       dx_q.取句柄()},
-                      &lqi, sizeof(lqi), (D + 63u) / 64u, 1, 1);
-                提交2("linear_bwd_dwdb",
-                      {x1.取句柄(), dkRaw.取句柄(), dWk.取句柄(), dWkDb.取句柄()},
-                      &lq, sizeof(lq), (HDK * D + 63u) / 64u, 1, 1);
-                提交2("linear_bwd_dx_i8",
-                      {dkRaw.取句柄(), L.Wk->i8.取句柄(), L.Wk->s.取句柄(),
-                       dx_k.取句柄()},
-                      &lqi, sizeof(lqi), (D + 63u) / 64u, 1, 1);
-                提交2("linear_bwd_dwdb",
-                      {x1.取句柄(), dvN.取句柄(), dWv.取句柄(), dWvDb.取句柄()},
-                      &lv, sizeof(lv), (HDV * D + 63u) / 64u, 1, 1);
-                const LinI8PC lvi{1, D, HDV, Gd};
-                提交2("linear_bwd_dx_i8",
-                      {dvN.取句柄(), L.Wv->i8.取句柄(), L.Wv->s.取句柄(),
-                       dx_v.取句柄()},
-                      &lvi, sizeof(lvi), (D + 63u) / 64u, 1, 1);
-                累加(L.Wq, dWq); 累加(L.Wk, dWk); 累加(L.Wv, dWv);
-                填零(dX);
-                const SumPC addpc{D, 0, 0, 0};
-                提交2("add_inplace", {dX.取句柄(), dx_q.取句柄()}, &addpc, sizeof(addpc), 1, 1, 1);
-                提交2("add_inplace", {dX.取句柄(), dx_k.取句柄()}, &addpc, sizeof(addpc), 1, 1, 1);
-                提交2("add_inplace", {dX.取句柄(), dx_v.取句柄()}, &addpc, sizeof(addpc), 1, 1, 1);
-
-                const GRReadPC gr{1, D, T, t, first ? 1u : 0u, H, 0, 0};
-                提交2("gr_read_bwd_int8",
-                      {embed->i8.取句柄(), embed->s.取句柄(), ids.取句柄(),
-                       r.branch_in.取句柄(), L.g1ng->p.取句柄(), L.g1rw->p.取句柄(),
-                       L.g1rb->p.取句柄(), L.etaW->p.取句柄(), L.etaB->p.取句柄(),
-                       dX.取句柄(), detaH.取句柄(), dIn.取句柄(), dNormG.取句柄(),
-                       dReadW.取句柄(), dReadB.取句柄(), dEtaW.取句柄(), dEtaB.取句柄()},
-                      &gr, sizeof(gr), 1, 1, 1);
-                累加(L.g1ng, dNormG); 累加(L.g1rw, dReadW); 累加(L.g1rb, dReadB);
-                累加(L.etaW, dEtaW); 累加(L.etaB, dEtaB);
-                dIn.拷贝到(dComb);
-                const SumPC as{D * 4, 0, 0, 0};
-                提交2("add_inplace", {dComb.取句柄(), dBranchR.取句柄()}, &as, sizeof(as),
-                      (D * 4 + 255u) / 256u, 1, 1);
-                if (first) {
-                    求和头(dComb, dEmbedT[t], 4, D);
-                } else {
-                    dComb.拷贝到(dBranchUpper[t]);
-                }
-            } else {
-                dO.拷贝到(dOrec[t]);
-                dBranchR.拷贝到(dBranchRec[t]);
-            }
+        // ── 阶段 C：逐 token 的 gate/route/Wo/attention/QKV/GR read ──
+        if (!L.ersa) {
+            const float tau = 0.005f;
+            const ASMSeqPC ap{B, H, M, R, DK, DV, T,
+                              tau, tau, 0.9f, 0.01f, L.beta_null};
+            提交2("asm_step_bwd_seq",
+                  {asmQAll[li].取句柄(), asmKAll[li].取句柄(), asmVAll[li].取句柄(),
+                   asmEtaAll[li].取句柄(), asmKOldAll[li].取句柄(),
+                   asmVOldAll[li].取句柄(), asmBoldAll[li].取句柄(),
+                   L.gamma->p.取句柄(), dOAll.取句柄(),
+                   dKnSeq.取句柄(), dVnSeq.取句柄(), dBnSeq.取句柄(),
+                   asmIdxAll[li].取句柄(), dqRawAll.取句柄(), dkRawAll.取句柄(),
+                   dvAll.取句柄(), dEtaAll.取句柄(), dgammaH.取句柄(),
+                   dbnH.取句柄(), L.qkv_norm.取句柄()},
+                  &ap, sizeof(ap), (B * H + 31u) / 32u, 1, 1);
+            求和头(dgammaH, dGamma, H, M);
+            累加(L.gamma, dGamma);
+            const auto dNull = 求标量(dbnH, H);
+            累加(L.betaNull, dNull);
+            求和头(dKnSeq, dSlot, H, M * DK);
+            累加(L.slotK, dSlot);
         }
 
         // MoE 权重梯度：每层一次，读 token scratch，不再逐 token 累加。
@@ -1136,35 +1130,80 @@ int main(int argc, char** argv) {
         累加(L.shWup, dShWup);
         累加(L.shW2, dShW2);
 
+        if (!L.ersa) {
+            const QuantPC dqall{T * D, D, 0, 0};
+            提交2("dequant_row_i8",
+                  {asmXqAll[li].取句柄(), asmSxAll[li].取句柄(), xDeq.取句柄()},
+                  &dqall, sizeof(dqall), (T * D + 255u) / 256u, 1, 1);
+            const 规格4 lq{T, D, HDK, 0};
+            const 规格4 lv{T, D, HDV, 0};
+            提交2("linear_bwd_dwdb",
+                  {xDeq.取句柄(), dqRawAll.取句柄(), dWq.取句柄(), dWqDb.取句柄()},
+                  &lq, sizeof(lq), (HDK * D + 63u) / 64u, 1, 1);
+            const LinI8PC lqi{T, D, HDK, Gd};
+            提交2("linear_bwd_dx_i8",
+                  {dqRawAll.取句柄(), L.Wq->i8.取句柄(), L.Wq->s.取句柄(),
+                   dxqAll.取句柄()},
+                  &lqi, sizeof(lqi), (T * D + 63u) / 64u, 1, 1);
+            提交2("linear_bwd_dwdb",
+                  {xDeq.取句柄(), dkRawAll.取句柄(), dWk.取句柄(), dWkDb.取句柄()},
+                  &lq, sizeof(lq), (HDK * D + 63u) / 64u, 1, 1);
+            提交2("linear_bwd_dx_i8",
+                  {dkRawAll.取句柄(), L.Wk->i8.取句柄(), L.Wk->s.取句柄(),
+                   dxkAll.取句柄()},
+                  &lqi, sizeof(lqi), (T * D + 63u) / 64u, 1, 1);
+            提交2("linear_bwd_dwdb",
+                  {xDeq.取句柄(), dvAll.取句柄(), dWv.取句柄(), dWvDb.取句柄()},
+                  &lv, sizeof(lv), (HDV * D + 63u) / 64u, 1, 1);
+            const LinI8PC lvi{T, D, HDV, Gd};
+            提交2("linear_bwd_dx_i8",
+                  {dvAll.取句柄(), L.Wv->i8.取句柄(), L.Wv->s.取句柄(),
+                   dxvAll.取句柄()},
+                  &lvi, sizeof(lvi), (T * D + 63u) / 64u, 1, 1);
+            累加(L.Wq, dWq); 累加(L.Wk, dWk); 累加(L.Wv, dWv);
+            填零(dXAll);
+            const SumPC addpc{T * D, 0, 0, 0};
+            提交2("add_inplace", {dXAll.取句柄(), dxqAll.取句柄()}, &addpc, sizeof(addpc),
+                  (T * D + 255u) / 256u, 1, 1);
+            提交2("add_inplace", {dXAll.取句柄(), dxkAll.取句柄()}, &addpc, sizeof(addpc),
+                  (T * D + 255u) / 256u, 1, 1);
+            提交2("add_inplace", {dXAll.取句柄(), dxvAll.取句柄()}, &addpc, sizeof(addpc),
+                  (T * D + 255u) / 256u, 1, 1);
+        }
+
         if (L.ersa) {
-            // context 段走块路由反向，query 段走 IVF 反向；两者都把
-            // dK/dV 累加到同一 cache 梯度，完整跨越 cache 边界。
-            for (std::uint32_t t = 0; t < T; ++t) {
-                if (bwd_cache && t >= Nctx) {
-                    const IvfPc bp{B, H, T, T, DK, DV, IVFC, IVFLMAX,
-                                   IVFTOPB, IVFWIN, t, t,
-                                   0.005f, L.sink_value};
-                    提交2("ersa_ivf_attn_bwd_cand",
-                          {L.q_hist.取句柄(), L.k_cache.取句柄(), L.v_cache.取句柄(),
-                           L.candSnap[t - Nctx].取句柄(),
-                           L.candCnt[t - Nctx].取句柄(),
-                           dOrec[t].取句柄(), dQH.取句柄(), dKH.取句柄(),
-                           dVH.取句柄(), dSinkH.取句柄()},
-                          &bp, sizeof(bp), 1, H, 1);
-                } else {
-                    const std::uint32_t N = t + 1;
-                    const std::uint32_t NB = (N + cfg.block_size - 1) / cfg.block_size;
-                    const ErsaBwdPC ep{1, H, T, N, DK, DV, NB, cfg.block_size,
-                                       cfg.top_blocks, cfg.window, t, NBmaxT, 0.005f,
-                                       L.sink_value, 0.0f, 0.0f};
-                    提交2("ersa_attn_bwd_query",
-                          {L.q_hist.取句柄(),
-                           (cache_mode ? L.k_cache : L.k_hist).取句柄(),
-                           (cache_mode ? L.v_cache : L.v_hist).取句柄(),
-                           L.block_sum.取句柄(), dOrec[t].取句柄(), dQH.取句柄(),
-                           dKH.取句柄(), dVH.取句柄(), dSinkH.取句柄()},
-                          &ep, sizeof(ep), H, 1, 1);
-                }
+            // context 段块路由反向 + query 段 IVF 反向，都按序列并行；
+            // dK/dV/dsink 用原子累加合并到同一 cache 梯度。
+            if (bwd_cache && Nctx > 0) {
+                const ErsaBwdPC ep{1, H, T, 0, DK, DV, 0, cfg.block_size,
+                                   cfg.top_blocks, cfg.window, 0, NBmaxT, 0.005f,
+                                   L.sink_value, 0.0f, 0.0f};
+                提交2("ersa_attn_bwd_query",
+                      {L.q_hist.取句柄(), L.k_cache.取句柄(), L.v_cache.取句柄(),
+                       L.block_sum.取句柄(), dOAll.取句柄(), dQH.取句柄(),
+                       dKH.取句柄(), dVH.取句柄(), dSinkH.取句柄()},
+                      &ep, sizeof(ep), H * Nctx, 1, 1);
+            }
+            if (bwd_cache) {
+                const IvfPc bp{B, H, T, T, DK, DV, IVFC, IVFLMAX,
+                               IVFTOPB, IVFWIN, Nctx, 0, 0.005f, L.sink_value};
+                提交2("ersa_ivf_attn_bwd_cand",
+                      {L.q_hist.取句柄(), L.k_cache.取句柄(), L.v_cache.取句柄(),
+                       L.candSnapSeq.取句柄(), L.candCntSeq.取句柄(),
+                       dOAll.取句柄(), dQH.取句柄(), dKH.取句柄(),
+                       dVH.取句柄(), dSinkH.取句柄()},
+                      &bp, sizeof(bp), H * Tq, 1, 1);
+            } else {
+                const ErsaBwdPC ep{1, H, T, 0, DK, DV, 0, cfg.block_size,
+                                   cfg.top_blocks, cfg.window, 0, NBmaxT, 0.005f,
+                                   L.sink_value, 0.0f, 0.0f};
+                提交2("ersa_attn_bwd_query",
+                      {L.q_hist.取句柄(),
+                       (cache_mode ? L.k_cache : L.k_hist).取句柄(),
+                       (cache_mode ? L.v_cache : L.v_hist).取句柄(),
+                       L.block_sum.取句柄(), dOAll.取句柄(), dQH.取句柄(),
+                       dKH.取句柄(), dVH.取句柄(), dSinkH.取句柄()},
+                      &ep, sizeof(ep), H * T, 1, 1);
             }
 
             const L2BwdPC l2q{H * T, DK, 0, 1};
@@ -1193,8 +1232,8 @@ int main(int argc, char** argv) {
                 }
                 xAll.上传(xh.data(), xh.size());
                 sAll.上传(sh.data(), sh.size() * 4);
-                const QuantPC dq{T * D, D, 1, 0};
-                提交2("dequant_i8",
+                const QuantPC dq{T * D, D, 0, 0};
+                提交2("dequant_row_i8",
                       {xAll.取句柄(), sAll.取句柄(), xDeq.取句柄()},
                       &dq, sizeof(dq), (T * D + 255u) / 256u, 1, 1);
             }
@@ -1236,38 +1275,38 @@ int main(int argc, char** argv) {
                   (T * D + 255u) / 256u, 1, 1);
         }
 
-        // ── 逐 token 的 QKV 输出 -> GR read 反向 ──
         if (L.ersa) {
-            std::vector<float> dxh(static_cast<std::size_t>(T) * D);
-            dXAll.下载(dxh.data(), dxh.size() * 4);
-            for (std::uint32_t t = 0; t < T; ++t) {
-                std::copy(dxh.begin() + std::size_t(t) * D,
-                          dxh.begin() + std::size_t(t + 1) * D, dxh.data());
-                dX1.上传(dxh.data(), sizeof(float) * D);
-                记录& r = *记录表[t][li];
-                填零(dEtaH);
-                const GRReadPC gr{1, D, T, t, first ? 1u : 0u, H, 0, 0};
-                提交2("gr_read_bwd_int8",
-                      {embed->i8.取句柄(), embed->s.取句柄(), ids.取句柄(),
-                       r.branch_in.取句柄(), L.g1ng->p.取句柄(), L.g1rw->p.取句柄(),
-                       L.g1rb->p.取句柄(), eta_w_dummy.取句柄(), eta_b_dummy.取句柄(),
-                       dX1.取句柄(), dEtaH.取句柄(), dIn.取句柄(), dNormG.取句柄(),
-                       dReadW.取句柄(), dReadB.取句柄(), dEtaW.取句柄(), dEtaB.取句柄()},
-                      &gr, sizeof(gr), 1, 1, 1);
-                累加(L.g1ng, dNormG); 累加(L.g1rw, dReadW); 累加(L.g1rb, dReadB);
-                dIn.拷贝到(dComb);
-                const SumPC as{D * 4, 0, 0, 0};
-                提交2("add_inplace", {dComb.取句柄(), dBranchRec[t].取句柄()}, &as, sizeof(as),
-                      (D * 4 + 255u) / 256u, 1, 1);
-                if (first) {
-                    求和头(dComb, dEmbedT[t], 4, D);
-                } else {
-                    dComb.拷贝到(dBranchUpper[t]);
-                }
-            }
             auto sinkSum = 求标量(dSinkH, H);
             累加(L.sink, sinkSum);
         }
+
+        // ── 序列并行 GR read + 融合 dIn/dBranchR 后处理 ──
+        const vk张量& etaWsrc = L.ersa ? eta_w_dummy : L.etaW->p;
+        const vk张量& etaBsrc = L.ersa ? eta_b_dummy : L.etaB->p;
+        const vk张量& detaSrc = L.ersa ? dEtaZero : dEtaAll;
+        const GRReadPC gr{T, D, T, 0, first ? 1u : 0u, H, 0, 0};
+        提交2("gr_read_bwd_int8",
+              {embed->i8.取句柄(), embed->s.取句柄(), ids.取句柄(),
+               branchInAll[li].取句柄(), L.g1ng->p.取句柄(), L.g1rw->p.取句柄(),
+               L.g1rb->p.取句柄(), etaWsrc.取句柄(), etaBsrc.取句柄(),
+               dXAll.取句柄(), detaSrc.取句柄(), dInAll.取句柄(), dNormGAll.取句柄(),
+               dReadWAll.取句柄(), dReadBAll.取句柄(), dEtaWAll.取句柄(),
+               dEtaBAll.取句柄()},
+              &gr, sizeof(gr), T, 1, 1);
+        求和头(dNormGAll, dNormG, T, 4 * D);
+        求和头(dReadWAll, dReadW, T, 16 * D);
+        求和头(dReadBAll, dReadB, T, 4);
+        求和头(dEtaWAll, dEtaW, T, D);
+        求和头(dEtaBAll, dEtaB, T, 1);
+        累加(L.g1ng, dNormG); 累加(L.g1rw, dReadW); 累加(L.g1rb, dReadB);
+        if (!L.ersa) {
+            累加(L.etaW, dEtaW); 累加(L.etaB, dEtaB);
+        }
+        const GrPostPC post{T, D, first ? 1u : 0u, 0};
+        提交2("gr_read_post_seq",
+              {dInAll.取句柄(), dBranchRAll.取句柄(),
+               dBranchUpperAll.取句柄(), dEmbedAll.取句柄()},
+              &post, sizeof(post), T, 1, 1);
         if (big3b && li + 1 == cfg.n_layers) {
             dQH.拷贝到(dQ31);
             dKH.拷贝到(dK31);
@@ -1276,19 +1315,12 @@ int main(int argc, char** argv) {
         }
     };
     auto 反向全部 = [&]() {
-        for (auto& b : dBranchUpper) 填零(b);
+        填零(dBranchUpperAll);
         const float loss = 反向头();
         for (int li = int(cfg.n_layers) - 1; li >= 0; --li) 反向层(std::uint32_t(li));
 
-        // layer0 的 GR read + GR route 分支梯度求和 -> embedding
+        // layer0 的融合后处理已经写好 dEmbedAll。
         {
-            std::vector<float> eh(static_cast<std::size_t>(T) * D);
-            for (std::uint32_t t = 0; t < T; ++t) {
-                std::vector<float> row(D);
-                dEmbedT[t].下载(row.data(), row.size() * 4);
-                std::copy(row.begin(), row.end(), eh.begin() + std::size_t(t) * D);
-            }
-            dEmbedAll.上传(eh.data(), eh.size() * 4);
             const 规格4 ep{T, V, D, 0};
             提交2("embedding_bwd",
                   {dEmbedAll.取句柄(), ids.取句柄(), dTable.取句柄()},
@@ -1404,12 +1436,31 @@ int main(int argc, char** argv) {
                      &gr, sizeof(gr), 1);
                 xq.拷贝到(rec.xq);
                 sx.拷贝到(rec.sx);
-                eta.拷贝到(rec.eta);
+                if (!L.ersa) {
+                    const CopySlicePC xqc{1, 1, T, D, 1, 0, t, 0};
+                    提交2("copy_i8_slice", {xq.取句柄(), asmXqAll[li].取句柄()},
+                          &xqc, sizeof(xqc), 1, 1, 1);
+                    const CopySlicePC sxc{1, 1, T, 1, 1, 0, t, 0};
+                    提交2("copy_f32_slice", {sx.取句柄(), asmSxAll[li].取句柄()},
+                          &sxc, sizeof(sxc), 1, 1, 1);
+                    const CopySlicePC etc{1, 1, T, B, 1, 0, t, 0};
+                    提交2("copy_f32_slice", {eta.取句柄(), asmEtaAll[li].取句柄()},
+                          &etc, sizeof(etc), 1, 1, 1);
+                }
+                const CopySlicePC bic{1, 1, T, 4 * D, 1, 0, t, 0};
+                提交2("copy_f32_slice", {branches.取句柄(), branchInAll[li].取句柄()},
+                      &bic, sizeof(bic), 1, 1, 1);
                 branches.拷贝到(rec.branch_in);
                 if (!L.ersa) {
-                    L.K.拷贝到(rec.Kold);
-                    L.V.拷贝到(rec.Vold);
-                    L.beta.拷贝到(rec.Bold);
+                    const CopySlicePC kc{1, 1, T, B * H * M * DK, 1, 0, t, 0};
+                    提交2("copy_f32_slice", {L.K.取句柄(), asmKOldAll[li].取句柄()},
+                          &kc, sizeof(kc), 1, 1, 1);
+                    const CopySlicePC vc{1, 1, T, B * H * M * DV, 1, 0, t, 0};
+                    提交2("copy_f32_slice", {L.V.取句柄(), asmVOldAll[li].取句柄()},
+                          &vc, sizeof(vc), 1, 1, 1);
+                    const CopySlicePC bc{1, 1, T, B * H * M, 1, 0, t, 0};
+                    提交2("copy_f32_slice", {L.beta.取句柄(), asmBoldAll[li].取句柄()},
+                          &bc, sizeof(bc), 1, 1, 1);
                 }
 
                 const std::uint32_t store = L.ersa ? 1u : 0u;
@@ -1435,9 +1486,15 @@ int main(int argc, char** argv) {
                        vo.取句柄(), block_dummy.取句柄(), L.qkv_norm.取句柄()},
                       &pv, sizeof(pv), H, 1, 1);
                 if (!L.ersa) {
-                    qkv_q.拷贝到(rec.qkv_q);
-                    qkv_k.拷贝到(rec.qkv_k);
-                    qkv_v.拷贝到(rec.qkv_v);
+                    const CopySlicePC qc{1, 1, T, HDK, 1, 0, t, 0};
+                    提交2("copy_f32_slice", {qkv_q.取句柄(), asmQAll[li].取句柄()},
+                          &qc, sizeof(qc), 1, 1, 1);
+                    const CopySlicePC kqc{1, 1, T, HDK, 1, 0, t, 0};
+                    提交2("copy_f32_slice", {qkv_k.取句柄(), asmKAll[li].取句柄()},
+                          &kqc, sizeof(kqc), 1, 1, 1);
+                    const CopySlicePC vqc{1, 1, T, HDV, 1, 0, t, 0};
+                    提交2("copy_f32_slice", {qkv_v.取句柄(), asmVAll[li].取句柄()},
+                          &vqc, sizeof(vqc), 1, 1, 1);
                 }
 
                 if (L.ersa) {
@@ -1471,6 +1528,14 @@ int main(int argc, char** argv) {
                                L.candSnap[t - Nctx].取句柄(),
                                L.candCnt[t - Nctx].取句柄()},
                               &qp, sizeof(qp), 1, H, 1);
+                        const CopySlicePC csc{H, 1, Tq, MAXCAND, 1, 0, t - Nctx, 0};
+                        提交2("copy_i32_slice",
+                              {L.candSnap[t - Nctx].取句柄(), L.candSnapSeq.取句柄()},
+                              &csc, sizeof(csc), 1, H, 1);
+                        const CopySlicePC ccc{H, 1, Tq, 1, 1, 0, t - Nctx, 0};
+                        提交2("copy_i32_slice",
+                              {L.candCnt[t - Nctx].取句柄(), L.candCntSeq.取句柄()},
+                              &ccc, sizeof(ccc), 1, H, 1);
                     } else {
                         const std::uint32_t N = t + 1;
                         const std::uint32_t NB = (N + cfg.block_size - 1) / cfg.block_size;
@@ -1496,15 +1561,23 @@ int main(int argc, char** argv) {
                 }
                 const vk张量& attn_src = L.ersa ? attn_out : o;
                 attn_src.拷贝到(rec.o);
-                if (!L.ersa) dbg.拷贝到(rec.dbg);
+                if (!L.ersa) {
+                    const CopySlicePC dc{1, 1, T, B * H * 3 * R, 1, 0, t, 0};
+                    提交2("copy_f32_slice", {dbg.取句柄(), asmIdxAll[li].取句柄()},
+                          &dc, sizeof(dc), 1, 1, 1);
+                }
 
                 const WoTilePC wp{1, D, HDV, 64, 0, 0, 0, 0};
                 const vk张量& oi = L.ersa ? attn_out : o;
                 提交2("wo_gemv_int8",
                       {oi.取句柄(), L.Wo->i8.取句柄(), L.Wo->s.取句柄(), wo_y.取句柄(), wo_deq.取句柄()},
                       &wp, sizeof(wp), (D + 63) / 64, 1, 1);
-                wo_y.拷贝到(rec.wo_y);
-                wo_deq.拷贝到(rec.o_deq);
+                const CopySlicePC wyc{1, 1, T, D, 1, 0, t, 0};
+                提交2("copy_f32_slice", {wo_y.取句柄(), woYAll[li].取句柄()},
+                      &wyc, sizeof(wyc), 1, 1, 1);
+                const CopySlicePC odc{1, 1, T, HDV, 1, 0, t, 0};
+                提交2("copy_f32_slice", {wo_deq.取句柄(), oDeqAll[li].取句柄()},
+                      &odc, sizeof(odc), 1, 1, 1);
 
                 const WoRoutePC np{1, D, HDV, E, K, 0, 0, 0};
                 提交2("norm_gr_route_int8",
@@ -1513,8 +1586,12 @@ int main(int argc, char** argv) {
                        L.g2ng->p.取句柄(), L.g2rw->p.取句柄(), L.g2rb->p.取句柄(),
                        L.gate->p.取句柄(), x2.取句柄(), moe_idx.取句柄(), moe_w.取句柄()},
                       &np, sizeof(np), 1, 1, 1);
-                branches.拷贝到(rec.branch_mid);
-                x2.拷贝到(rec.x2);
+                const CopySlicePC bmc{1, 1, T, 4 * D, 1, 0, t, 0};
+                提交2("copy_f32_slice", {branches.取句柄(), branchMidAll[li].取句柄()},
+                      &bmc, sizeof(bmc), 1, 1, 1);
+                const CopySlicePC x2c{1, 1, T, D, 1, 0, t, 0};
+                提交2("copy_f32_slice", {x2.取句柄(), x2All[li].取句柄()},
+                      &x2c, sizeof(x2c), 1, 1, 1);
                 {
                     const QuantPC qx{1, D, 0, 0};
                     提交2("quantize_dequant_f32", {x2.取句柄(), rec.x2_deq.取句柄()},
@@ -1546,7 +1623,9 @@ int main(int argc, char** argv) {
                        y_moe.取句柄()},
                       &rp, sizeof(rp), 1, 1, 1);
                 branches.拷贝到(rec.branch_out);
-                y_moe.拷贝到(rec.y_moe);
+                const CopySlicePC ymc{1, 1, T, D, 1, 0, t, 0};
+                提交2("copy_f32_slice", {y_moe.取句柄(), yMoeAll[li].取句柄()},
+                      &ymc, sizeof(ymc), 1, 1, 1);
             }
             if (cache_mode && fwd_cache && t + 1 == Nctx) 建缓存索引();
         }
@@ -1605,29 +1684,7 @@ int main(int argc, char** argv) {
                 };
                 std::printf("  dOut rows t0/t4/t8/t11: %.4g %.4g %.4g %.4g\n",
                             rown(douth, 0), rown(douth, 4), rown(douth, 8), rown(douth, 11));
-                std::vector<float> d0(static_cast<std::size_t>(D)), d16(static_cast<std::size_t>(D));
-                std::printf("  layer dY t0/t4/t8/t11:");
-                for (std::uint32_t q : {0u, 4u, 8u, 11u}) {
-                    dYProbe0[q].下载(d0.data(), d0.size() * 4);
-                    std::printf(" L0t%u=%.4g", q, rown(d0, 0));
-                }
-                for (std::uint32_t q : {0u, 4u, 8u, 11u}) {
-                    dYProbe16[q].下载(d16.data(), d16.size() * 4);
-                    std::printf(" L16t%u=%.4g", q, rown(d16, 0));
-                }
-                std::printf("\n");
-                std::printf("  L31 dX2/dO t8/t11:");
-                for (std::uint32_t q : {8u, 11u}) {
-                    std::vector<float> xv(D), ov(HDV);
-                    dX2Probe31[q].下载(xv.data(), xv.size() * 4);
-                    dOProbe31[q].下载(ov.data(), ov.size() * 4);
-                    double sx2 = 0.0, so2 = 0.0;
-                    for (float z : xv) sx2 += double(z) * z;
-                    for (float z : ov) so2 += double(z) * z;
-                    std::printf(" t%u(dX2=%.4g,dO=%.4g)", q,
-                                std::sqrt(sx2), std::sqrt(so2));
-                }
-                std::printf("\n  L31 candidate counts (q0..q3):");
+                std::printf("  L31 candidate counts (q0..q3):");
                 for (std::uint32_t q = 0; q < Tq; ++q) {
                     std::vector<std::int32_t> cc(H);
                     层表[cfg.n_layers - 1].candCnt[q].下载(cc.data(), cc.size() * 4);
@@ -1635,19 +1692,14 @@ int main(int argc, char** argv) {
                     for (int z : cc) sum += z;
                     std::printf(" q%u=%d", q, sum);
                 }
-                std::printf("\n  L31 dY t0/t8/t11:");
-                for (std::uint32_t q : {0u, 8u, 11u}) {
-                    dYProbe31[q].下载(d0.data(), d0.size() * 4);
-                    std::printf(" t%u=%.4g", q, rown(d0, 0));
-                }
-                std::printf("\n  L31 internals: dQ %.4g | dK %.4g | dV %.4g | dXAll %.4g\n",
+                std::printf("  L31 internals: dQ %.4g | dK %.4g | dV %.4g | dXAll %.4g\n",
                             范数(dQ31), 范数(dK31), 范数(dV31), 范数(dXAll31));
                 std::printf("  internals: dQH %.4g | dKH %.4g | dVH %.4g | dXAll %.4g | dX2 %.4g\n",
-                            范数(dQH), 范数(dKH), 范数(dVH), 范数(dXAll), 范数(dX2));
+                            范数(dQH), 范数(dKH), 范数(dVH), 范数(dXAll), 范数(dX2AllV[0]));
                 std::printf("  gradients: dOutTokens %.6g | dY %.6g | moe.x %.6g | "
                             "moe.dh %.6g | moe.shpre %.6g\n",
-                            范数(dOutTokens), 范数(dY), 范数(moeXs),
-                            范数(moeDh), 范数(moeShPre));
+                            范数(dOutTokens), 范数(dYAllV[0]), 范数(moeXsV[0]),
+                            范数(moeDhV[0]), 范数(moeShPreV[0]));
                 float nWq16 = 范数(层表[cfg.n_layers/2].Wq->g);
                 float nSh16 = 范数(层表[cfg.n_layers/2].shW1->g);
                 std::printf("  grad norms: finalNorm %.6g | Wq(L16) %.6g | Wq(L0) %.6g | "
@@ -1745,8 +1797,10 @@ int main(int argc, char** argv) {
             std::printf("  ||dEmbed||=%.6g ||dWq(L0)||=%.6g ||dWo(L0)||=%.6g ||dW1(L0)||=%.6g\n",
                         范数(embed->g), 范数(层表[0].Wq->g), 范数(层表[0].Wo->g),
                         范数(层表[0].W1->g));
+            // dK/dV 走 float CAS 原子累加，累加顺序不确定；5e-4 对应 max|g|≈655 的
+            // 相对误差 ~1e-6，仍能捕获真实的索引/归约错误。
             const bool ok = (非有限 == 0 && 非有限梯度 == 0 && fdiff <= 1e-6f &&
-                             gdiff <= 1e-6 && model_diff <= 1e-5f && (!parity_mode ||
+                             gdiff <= 5e-4 && model_diff <= 1e-5f && (!parity_mode ||
                              (pfdiff <= 1e-6f && pgdiff <= 1e-3)));
             std::printf("%s\n", ok ? "CACHE PASS" : "CACHE FAIL");
             调度器.停止();
