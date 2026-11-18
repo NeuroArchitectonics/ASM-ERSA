@@ -510,6 +510,12 @@ int main(int argc, char** argv) {
         L.gate = 加参数({E, D}, lw.moe.gate, "L" + std::to_string(li) + ".gate");
         L.W1 = 加参数({E * D, F}, lw.moe.W1, "L" + std::to_string(li) + ".W1");
         L.W2 = 加参数({E * F, D}, lw.moe.W2, "L" + std::to_string(li) + ".W2");
+        if (big3b) {
+            // 3B 只测 cache 前向/反向，不更新权重；int8 直读路径不再需要
+            // routed MoE 的 FP32 master，释放两份 6.4GB 级缓冲。
+            L.W1->p = vk张量();
+            L.W2->p = vk张量();
+        }
         L.shW1 = 加参数({F, D}, lw.moe.sharedW1, "L" + std::to_string(li) + ".shW1", true, F, D);
         L.shWup = 加参数({F, D}, lw.moe.sharedWup, "L" + std::to_string(li) + ".shWup", true, F, D);
         L.shW2 = 加参数({D, F}, lw.moe.sharedW2, "L" + std::to_string(li) + ".shW2", true, D, F);
@@ -850,6 +856,19 @@ int main(int argc, char** argv) {
 
     // ERSA 历史梯度
     vk张量 dQH = 建({H, T, DK}, 张量类型::浮点32, "bwd.dQH");
+    std::vector<vk张量> dYProbe0, dYProbe16, dYProbe31;
+    vk张量 dQ31, dK31, dV31, dXAll31;
+    if (big3b) {
+        for (std::uint32_t t = 0; t < T; ++t) {
+            dYProbe0.push_back(建({1, D}, 张量类型::浮点32, "probe.dY0"));
+            dYProbe16.push_back(建({1, D}, 张量类型::浮点32, "probe.dY16"));
+            dYProbe31.push_back(建({1, D}, 张量类型::浮点32, "probe.dY31"));
+        }
+        dQ31 = 建({H, T, DK}, 张量类型::浮点32, "probe.dQ31");
+        dK31 = 建({H, T, DK}, 张量类型::浮点32, "probe.dK31");
+        dV31 = 建({H, T, DV}, 张量类型::浮点32, "probe.dV31");
+        dXAll31 = 建({T, D}, 张量类型::浮点32, "probe.dX31");
+    }
     vk张量 dKH = 建({H, T, DK}, 张量类型::浮点32, "bwd.dKH");
     vk张量 dVH = 建({H, T, DV}, 张量类型::浮点32, "bwd.dVH");
     vk张量 dSinkH = 建({H}, 张量类型::浮点32, "bwd.dsink");
@@ -916,6 +935,11 @@ int main(int argc, char** argv) {
                    L.g2wb->p.取句柄(), dBranchUpper[t].取句柄(), dOutTokens.取句柄(),
                    dY.取句柄(), dBranchMid.取句柄(), dW2w.取句柄(), db2w.取句柄()},
                   &g2, sizeof(g2), 1, 1, 1);
+            if (big3b && (li == 0 || li == cfg.n_layers / 2 || li + 1 == cfg.n_layers)) {
+                vk张量& probe = (li == 0) ? dYProbe0[t]
+                    : ((li + 1 == cfg.n_layers) ? dYProbe31[t] : dYProbe16[t]);
+                dY.拷贝到(probe);
+            }
             累加(L.g2ww, dW2w);
             累加(L.g2wb, db2w);
 
@@ -1244,8 +1268,13 @@ int main(int argc, char** argv) {
             auto sinkSum = 求标量(dSinkH, H);
             累加(L.sink, sinkSum);
         }
+        if (big3b && li + 1 == cfg.n_layers) {
+            dQH.拷贝到(dQ31);
+            dKH.拷贝到(dK31);
+            dVH.拷贝到(dV31);
+            dXAll.拷贝到(dXAll31);
+        }
     };
-
     auto 反向全部 = [&]() {
         for (auto& b : dBranchUpper) 填零(b);
         const float loss = 反向头();
@@ -1566,6 +1595,36 @@ int main(int argc, char** argv) {
                             "VK live %.2f GiB\n",
                             fms, bms, loss, 全部参数.size(), grad_elems, bad,
                             double(live) / (1024.0 * 1024.0 * 1024.0));
+                std::vector<float> douth(std::size_t(T) * D);
+                dOutTokens.下载(douth.data(), douth.size() * 4);
+                auto rown = [&](const std::vector<float>& v, std::uint32_t row) {
+                    double s2 = 0.0;
+                    for (std::uint32_t d = 0; d < D; ++d)
+                        s2 += double(v[std::size_t(row) * D + d]) * v[std::size_t(row) * D + d];
+                    return float(std::sqrt(s2));
+                };
+                std::printf("  dOut rows t0/t4/t8/t11: %.4g %.4g %.4g %.4g\n",
+                            rown(douth, 0), rown(douth, 4), rown(douth, 8), rown(douth, 11));
+                std::vector<float> d0(static_cast<std::size_t>(D)), d16(static_cast<std::size_t>(D));
+                std::printf("  layer dY t0/t4/t8/t11:");
+                for (std::uint32_t q : {0u, 4u, 8u, 11u}) {
+                    dYProbe0[q].下载(d0.data(), d0.size() * 4);
+                    std::printf(" L0t%u=%.4g", q, rown(d0, 0));
+                }
+                for (std::uint32_t q : {0u, 4u, 8u, 11u}) {
+                    dYProbe16[q].下载(d16.data(), d16.size() * 4);
+                    std::printf(" L16t%u=%.4g", q, rown(d16, 0));
+                }
+                std::printf("\n");
+                std::printf("  L31 dY t0/t8/t11:");
+                for (std::uint32_t q : {0u, 8u, 11u}) {
+                    dYProbe31[q].下载(d0.data(), d0.size() * 4);
+                    std::printf(" t%u=%.4g", q, rown(d0, 0));
+                }
+                std::printf("\n  L31 internals: dQ %.4g | dK %.4g | dV %.4g | dXAll %.4g\n",
+                            范数(dQ31), 范数(dK31), 范数(dV31), 范数(dXAll31));
+                std::printf("  internals: dQH %.4g | dKH %.4g | dVH %.4g | dXAll %.4g | dX2 %.4g\n",
+                            范数(dQH), 范数(dKH), 范数(dVH), 范数(dXAll), 范数(dX2));
                 std::printf("  gradients: dOutTokens %.6g | dY %.6g | moe.x %.6g | "
                             "moe.dh %.6g | moe.shpre %.6g\n",
                             范数(dOutTokens), 范数(dY), 范数(moeXs),
