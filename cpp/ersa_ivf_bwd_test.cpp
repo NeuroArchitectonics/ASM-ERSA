@@ -219,6 +219,8 @@ int main(int argc, char** argv) {
         vk张量 qht = mk({H, QT, DK}, 张量类型::浮点32, "qidx.qhist");
         vk张量 of = mk({H, N, DV}, 张量类型::浮点32, "qidx.of");
         vk张量 oq = mk({H, DV}, 张量类型::浮点32, "qidx.oq");
+        vk张量 qcand = mk({H, 1024}, 张量类型::整数32, "qidx.cand");
+        vk张量 qcnt = mk({H}, 张量类型::整数32, "qidx.cnt");
         vk张量 dq4 = mk({H, QT, DK}, 张量类型::浮点32, "qidx.dq4");
         vk张量 dk4 = mk({H, N, DK}, 张量类型::浮点32, "qidx.dk4");
         vk张量 dv4 = mk({H, N, DV}, 张量类型::浮点32, "qidx.dv4");
@@ -239,7 +241,8 @@ int main(int argc, char** argv) {
         const IvfBwdPC qp{1, H, QT, N, DK, DV, C, LMAX, QTOPB, QW, QP, QI, tau, sink};
         run("ersa_ivf_attn_query",
             {qht.取句柄(), kd.取句柄(), vd.取句柄(), ctd.取句柄(),
-             mid.取句柄(), cnd.取句柄(), oq.取句柄()},
+             mid.取句柄(), cnd.取句柄(), oq.取句柄(), qcand.取句柄(),
+             qcnt.取句柄()},
             &qp, sizeof(qp), 1, H, 1);
         run("ersa_ivf_attn_bwd_query",
             {qht.取句柄(), kd.取句柄(), vd.取句柄(), ctd.取句柄(),
