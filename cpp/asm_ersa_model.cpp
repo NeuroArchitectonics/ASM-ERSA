@@ -72,9 +72,12 @@ static_assert(sizeof(AsmResetPC) == 32, "AsmResetPC must be 32 bytes");
 
 struct AsmStepPC {
     uint32_t B, H, M, DK, DV, R, pad0, pad1;
-    float tau, tau_w, rho, lam, null_beta, pad2;
+    float tau, tau_w, rho, lam, null_beta, tau_new, pad2;
 };
-static_assert(sizeof(AsmStepPC) == 56, "AsmStepPC must be 56 bytes");
+static_assert(sizeof(AsmStepPC) == 60, "AsmStepPC must be 60 bytes");
+
+// 与训练器保持同一新颖性阈值。
+static constexpr float ASM新颖阈值 = 0.15f;
 
 struct ErsaStepPC {
     uint32_t B, H, T, N, DK, DV, NB, BLOCK, TOPB, WINDOW, QOFF, NBMAX;
@@ -1012,7 +1015,8 @@ void Impl::append_asm_step(LayerDev& L, std::vector<算子步骤>& steps) {
     const uint32_t H = cfg.n_heads, DK = cfg.d_k, DV = cfg.d_v;
     const float tau = 0.005f;
     const AsmStepPC pc{1, H, cfg.n_slots, DK, DV, cfg.top_r, 0, 0,
-                       tau, tau, 0.9f, 0.01f, L.asm_dev.beta_null, 0.0f};
+                       tau, tau, 0.9f, 0.01f, L.asm_dev.beta_null,
+                       ASM新颖阈值, 0.0f};
     append_step(steps, "asm_step_eta",
                 {qkv_q.取句柄(), qkv_k.取句柄(), qkv_v.取句柄(),
                  L.asm_dev.K.取句柄(), L.asm_dev.V.取句柄(), L.asm_dev.beta.取句柄(),
