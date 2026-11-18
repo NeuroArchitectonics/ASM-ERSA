@@ -40,7 +40,8 @@ int main(int argc, char** argv) {
 
     const char* required[] = {
         "gr_qkv_int8", "asm_reset", "asm_step_eta", "ersa_attn_step",
-        "wo_gr_route_int8", "moe_experts_int8", "moe_reduce_grwrite_int8",
+        "wo_gr_route_int8", "moe_experts_int8",
+        "moe_h_fused_int8", "moe_tail_w2_int8", "moe_grwrite_int8",
         "rmsnorm_quant", "linear_fwd_int8_f32"};
     for (const char* op : required) {
         if (!sched.存在算子(op)) {

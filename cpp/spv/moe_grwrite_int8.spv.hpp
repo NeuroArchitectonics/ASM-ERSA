@@ -1,6 +1,6 @@
 // ===========================================================================
-//  自动生成自 D:\智能体工作区\ASM-ERSA\cpp\glsl\moe_reduce_grwrite_int8.comp  —— 请勿手工编辑
-//  由 着色编译器 产出，与同目录 moe_reduce_grwrite_int8.spv 严格同源
+//  自动生成自 glsl\moe_grwrite_int8.comp  —— 请勿手工编辑
+//  由 着色编译器 产出，与同目录 moe_grwrite_int8.spv 严格同源
 // ===========================================================================
 #pragma once
 
@@ -8,13 +8,13 @@
 
 namespace vk张量系统 {
 
-inline const 着色器元信息 元信息_moe_reduce_grwrite_int8 = [] {
+inline const 着色器元信息 元信息_moe_grwrite_int8 = [] {
     着色器元信息 信息;
-    信息.算子名       = "moe_reduce_grwrite_int8";
+    信息.算子名       = "moe_grwrite_int8";
     信息.工作组大小   = 256u;   // local_size_x
-    信息.绑定数       = 13u;   // 14 项含推送常量
+    信息.绑定数       = 6u;   // 7 项含推送常量
     信息.推送常量字节 = 32u;
-    信息.产物指纹     = 3474295084u;   // SPIR-V FNV-1a
+    信息.产物指纹     = 4054546678u;   // SPIR-V FNV-1a
     流水线调度器::获取().登记元信息(信息);
     return 信息;
 }();

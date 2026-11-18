@@ -11,15 +11,16 @@
 #include "cpp/spv/gr_qkv_int8.spv.hpp"
 #include "cpp/spv/wo_gr_route_int8.spv.hpp"
 #include "cpp/spv/moe_experts_int8.spv.hpp"
-#include "cpp/spv/moe_reduce_grwrite_int8.spv.hpp"
+#include "cpp/spv/moe_tail_w2_int8.spv.hpp"
+#include "cpp/spv/moe_grwrite_int8.spv.hpp"
 #include "cpp/spv/gr_read_quant_int8.spv.hpp"
 #include "cpp/spv/qkv_int8_head.spv.hpp"
-#include "cpp/spv/qkv_gemv_int8.spv.hpp"
+#include "cpp/spv/qkv_fused_gemv_int8.spv.hpp"
 #include "cpp/spv/wo_int8_tile.spv.hpp"
 #include "cpp/spv/wo_gemv_int8.spv.hpp"
 #include "cpp/spv/norm_gr_route_int8.spv.hpp"
 #include "cpp/spv/moe_h_int8.spv.hpp"
-#include "cpp/spv/moe_h_gemv_int8.spv.hpp"
+#include "cpp/spv/moe_h_fused_int8.spv.hpp"
 #include "cpp/spv/moe_out_int8.spv.hpp"
 #include "cpp/spv/moe_out_gemv_int8.spv.hpp"
 #include "cpp/spv/lm_head_gemv_int8.spv.hpp"
@@ -96,15 +97,19 @@ struct MoeReducePC {
 };
 static_assert(sizeof(MoeReducePC) == 32, "MoeReducePC must be 32 bytes");
 
+
+struct MoeTailW2PC { uint32_t B, D, F, TOPK, pad0, pad1, pad2, pad3; };
+static_assert(sizeof(MoeTailW2PC) == 32, "MoeTailW2PC must be 32 bytes");
+
 struct GRReadPC {
     uint32_t B, D, T, t, first, pad0, pad1, pad2;
 };
 static_assert(sizeof(GRReadPC) == 32, "GRReadPC must be 32 bytes");
 
-struct QkvGemvPC {
-    uint32_t B, D, H, DK, DV, T, t, proj, store, NBmax, BLOCK, pad;
+struct QkvFusedPC {
+    uint32_t B, D, H, DK, DV, Tq, Tk, t, qt, store, NBmax, BLOCK, pad;
 };
-static_assert(sizeof(QkvGemvPC) == 48, "QkvGemvPC must be 48 bytes");
+static_assert(sizeof(QkvFusedPC) == 52, "QkvFusedPC must be 52 bytes");
 
 struct WoTilePC {
     uint32_t B, D, HDV, TILE, pad0, pad1, pad2, pad3;
@@ -318,7 +323,7 @@ struct Impl {
     vk张量 branches, out_tokens, normed_q, normed_s, logits, ids;
     vk张量 qkv_norm, moe_y;
     vk张量 x2, moe_idx, moe_weight, expert_out;
-    vk张量 xq, sx, wo_y, wo_deq, h_q, h_s;
+    vk张量 xq, sx, wo_y, wo_deq, h_q, h_s, sh_hq, sh_hs;
     vk张量 qkv_q, qkv_k, qkv_v, o, attn_out, eta, dbg, block_sum_dummy;
     vk张量 eta_w_dummy, eta_b_dummy;
     vk张量 q_one, ivf_assign_new, ivf_overflow;
@@ -706,6 +711,8 @@ Impl::Impl(const ModelConfig& cfg_, const ModelWeights* weights, const std::stri
     wo_deq = make_empty_f32({1, HDV}, "wo_deq");
     h_q = make_empty_i8({1, cfg.moe_top_k, F}, "h_q");
     h_s = make_empty_f32({1, cfg.moe_top_k, Gf}, "h_s");
+    sh_hq = make_empty_i8({1, F}, "sh_hq");
+    sh_hs = make_empty_f32({1, Gf}, "sh_hs");
 
     qkv_q = make_empty_f32({1, HDK}, "qkv_q");
     qkv_k = make_empty_f32({1, HDK}, "qkv_k");
@@ -969,7 +976,8 @@ void Impl::append_gr_read(LayerDev& L, uint32_t layer_index, uint32_t t,
                 {embed_i8.取句柄(), embed_s.取句柄(), ids.取句柄(), branches.取句柄(),
                  L.gr1.norm_g.取句柄(), L.gr1.read_w.取句柄(), L.gr1.read_b.取句柄(),
                  eww.取句柄(), ebb.取句柄(),
-                 xq.取句柄(), sx.取句柄(), eta.取句柄()},
+                 xq.取句柄(), sx.取句柄(), eta.取句柄(),
+                 branches.取句柄(), xq.取句柄(), sx.取句柄(), eta.取句柄()},
                 pc, 1, 1, 1);
 }
 
@@ -989,22 +997,15 @@ void Impl::append_qkv_head(LayerDev& L, uint32_t t, std::vector<算子步骤>& s
     const vk张量& v_out = L.is_ersa ? L.ersa_dev.v_hist : qkv_v;
     const vk张量& bs = L.is_ersa ? L.ersa_dev.block_sum : block_sum_dummy;
 
-    const QkvGemvPC pq{1, D, H, DK, DV, Tmax, t, 0, store, NBmax, cfg.block_size, 0};
-    const QkvGemvPC pk{1, D, H, DK, DV, Tmax, t, 1, store, NBmax, cfg.block_size, 0};
-    const QkvGemvPC pv{1, D, H, DK, DV, Tmax, t, 2, store, NBmax, cfg.block_size, 0};
-
-    append_step(steps, "qkv_gemv_int8",
-                {xq.取句柄(), sx.取句柄(), Wq_i8.取句柄(), Wq_s.取句柄(),
-                 q_out.取句柄(), block_sum_dummy.取句柄(), qkv_norm.取句柄()},
-                pq, H, 1, 1);
-    append_step(steps, "qkv_gemv_int8",
-                {xq.取句柄(), sx.取句柄(), Wk_i8.取句柄(), Wk_s.取句柄(),
-                 k_out.取句柄(), bs.取句柄(), qkv_norm.取句柄()},
-                pk, H, 1, 1);
-    append_step(steps, "qkv_gemv_int8",
-                {xq.取句柄(), sx.取句柄(), Wv_i8.取句柄(), Wv_s.取句柄(),
-                 v_out.取句柄(), block_sum_dummy.取句柄(), qkv_norm.取句柄()},
-                pv, H, 1, 1);
+    const QkvFusedPC qk{1, D, H, DK, DV, Tmax, Tmax, t, t, store,
+                        NBmax, cfg.block_size, 0};
+    append_step(steps, "qkv_fused_gemv_int8",
+                {xq.取句柄(), sx.取句柄(),
+                 Wq_i8.取句柄(), Wq_s.取句柄(), Wk_i8.取句柄(), Wk_s.取句柄(),
+                 Wv_i8.取句柄(), Wv_s.取句柄(),
+                 q_out.取句柄(), k_out.取句柄(), v_out.取句柄(), bs.取句柄(),
+                 qkv_norm.取句柄(), qkv_norm.取句柄(), qkv_norm.取句柄(), qkv_norm.取句柄()},
+                qk, H, 3, 1);
 }
 
 void Impl::append_asm_step(LayerDev& L, std::vector<算子步骤>& steps) {
@@ -1015,7 +1016,8 @@ void Impl::append_asm_step(LayerDev& L, std::vector<算子步骤>& steps) {
     append_step(steps, "asm_step_eta",
                 {qkv_q.取句柄(), qkv_k.取句柄(), qkv_v.取句柄(),
                  L.asm_dev.K.取句柄(), L.asm_dev.V.取句柄(), L.asm_dev.beta.取句柄(),
-                 L.asm_dev.gamma.取句柄(), o.取句柄(), eta.取句柄(), dbg.取句柄()},
+                 L.asm_dev.gamma.取句柄(), o.取句柄(), eta.取句柄(), dbg.取句柄(),
+                 dbg.取句柄(), dbg.取句柄(), dbg.取句柄(), dbg.取句柄()},
                 pc, H, 1, 1);
 }
 
@@ -1041,7 +1043,8 @@ void Impl::append_wo_tile(LayerDev& L, std::vector<算子步骤>& steps) {
     const vk张量& Wo_s = L.is_ersa ? L.ersa_dev.Wo_s : L.asm_dev.Wo_s;
     const uint32_t tiles = (D + TILE - 1) / TILE;
     append_step(steps, "wo_gemv_int8",
-                {o_in.取句柄(), Wo_i8.取句柄(), Wo_s.取句柄(), wo_y.取句柄(), wo_deq.取句柄()},
+                {o_in.取句柄(), Wo_i8.取句柄(), Wo_s.取句柄(), wo_y.取句柄(), wo_deq.取句柄(),
+                 wo_y.取句柄(), wo_deq.取句柄()},
                 pc, tiles, 1, 1);
 }
 
@@ -1053,7 +1056,9 @@ void Impl::append_norm_route(LayerDev& L, std::vector<算子步骤>& steps) {
                 {wo_y.取句柄(), out_norm.取句柄(), branches.取句柄(),
                  L.gr1.write_w.取句柄(), L.gr1.write_b.取句柄(),
                  L.gr2.norm_g.取句柄(), L.gr2.read_w.取句柄(), L.gr2.read_b.取句柄(),
-                 L.moe.gate.取句柄(), x2.取句柄(), moe_idx.取句柄(), moe_weight.取句柄()},
+                 L.moe.gate.取句柄(), x2.取句柄(), moe_idx.取句柄(), moe_weight.取句柄(),
+                 branches.取句柄(), x2.取句柄(),
+                 moe_idx.取句柄(), moe_weight.取句柄()},
                 pc, 1, 1, 1);
 }
 
@@ -1062,10 +1067,13 @@ void Impl::append_moe_h(LayerDev& L, std::vector<算子步骤>& steps) {
     const uint32_t TILE_F = 128;
     const MoeExpertsPC pc{1, D, F, cfg.n_experts, cfg.moe_top_k, TILE_F, 0, 0};
     const uint32_t fgroups = (F + TILE_F - 1) / TILE_F;
-    append_step(steps, "moe_h_gemv_int8",
+    append_step(steps, "moe_h_fused_int8",
                 {x2.取句柄(), L.moe.W1_i8.取句柄(), L.moe.W1_s.取句柄(),
-                 moe_idx.取句柄(), h_q.取句柄(), h_s.取句柄()},
-                pc, cfg.moe_top_k, fgroups, 1);
+                 moe_idx.取句柄(), h_q.取句柄(), h_s.取句柄(),
+                 L.moe.sharedW1_i8.取句柄(), L.moe.sharedW1_s.取句柄(),
+                 L.moe.sharedWup_i8.取句柄(), L.moe.sharedWup_s.取句柄(),
+                 sh_hq.取句柄(), sh_hs.取句柄()},
+                pc, cfg.moe_top_k + 1, fgroups, 1);
 }
 
 void Impl::append_moe_out(LayerDev& L, std::vector<算子步骤>& steps) {
@@ -1083,15 +1091,17 @@ void Impl::append_moe_out(LayerDev& L, std::vector<算子步骤>& steps) {
 void Impl::append_moe_reduce(LayerDev& L, uint32_t t, bool write_out,
                              std::vector<算子步骤>& steps) {
     const uint32_t D = cfg.d_model, F = cfg.d_ff;
-    const MoeReducePC rp{1, D, F, cfg.moe_top_k, CHUNK, t, Tmax, write_out ? 1u : 0u};
-    append_step(steps, "moe_reduce_grwrite_int8",
-                {x2.取句柄(), L.moe.sharedW1_i8.取句柄(), L.moe.sharedW1_s.取句柄(),
-                 L.moe.sharedWup_i8.取句柄(), L.moe.sharedWup_s.取句柄(),
+    const MoeTailW2PC tw{1, D, F, cfg.moe_top_k, 0, 0, 0, 0};
+    append_step(steps, "moe_tail_w2_int8",
+                {expert_out.取句柄(), sh_hq.取句柄(), sh_hs.取句柄(),
                  L.moe.sharedW2_i8.取句柄(), L.moe.sharedW2_s.取句柄(),
-                 expert_out.取句柄(), branches.取句柄(),
-                 L.gr2.write_w.取句柄(), L.gr2.write_b.取句柄(), out_tokens.取句柄(),
-                 moe_y.取句柄()},
-                rp, 1, 1, 1);
+                 moe_y.取句柄(), moe_y.取句柄()},
+                tw, (D + 63) / 64, 1, 1);
+    const MoeReducePC rp{1, D, F, cfg.moe_top_k, CHUNK, t, Tmax, write_out ? 1u : 0u};
+    append_step(steps, "moe_grwrite_int8",
+                {moe_y.取句柄(), L.gr2.write_w.取句柄(), L.gr2.write_b.取句柄(),
+                 branches.取句柄(), out_tokens.取句柄(), branches.取句柄()},
+                rp, (D + 255) / 256, 1, 1);
 }
 
 void Impl::ensure_ersa_cache(uint32_t nctx, uint32_t cap) {
@@ -1199,24 +1209,16 @@ void Impl::append_qkv_prefill(LayerDev& L, uint32_t pos,
     const uint32_t H = cfg.n_heads, DK = cfg.d_k, DV = cfg.d_v;
     const uint32_t D = cfg.d_model;
     ERSADev& E = L.ersa_dev;
-    const QkvGemvPC pq{1, D, H, DK, DV, cache_ctx, pos, 0, 1,
-                       cache_nbmax, cfg.block_size, 0};
-    const QkvGemvPC pk{1, D, H, DK, DV, cache_ctx, pos, 1, 1,
-                       cache_nbmax, cfg.block_size, 0};
-    const QkvGemvPC pv{1, D, H, DK, DV, cache_ctx, pos, 2, 1,
-                       cache_nbmax, cfg.block_size, 0};
-    append_step(steps, "qkv_gemv_int8",
-                {xq.取句柄(), sx.取句柄(), E.Wq_i8.取句柄(), E.Wq_s.取句柄(),
-                 E.q_cache.取句柄(), block_sum_dummy.取句柄(), qkv_norm.取句柄()},
-                pq, H, 1, 1);
-    append_step(steps, "qkv_gemv_int8",
-                {xq.取句柄(), sx.取句柄(), E.Wk_i8.取句柄(), E.Wk_s.取句柄(),
-                 E.k_cache.取句柄(), E.block_sum.取句柄(), qkv_norm.取句柄()},
-                pk, H, 1, 1);
-    append_step(steps, "qkv_gemv_int8",
-                {xq.取句柄(), sx.取句柄(), E.Wv_i8.取句柄(), E.Wv_s.取句柄(),
-                 E.v_cache.取句柄(), block_sum_dummy.取句柄(), qkv_norm.取句柄()},
-                pv, H, 1, 1);
+    const QkvFusedPC qk{1, D, H, DK, DV, cache_ctx, cache_ctx, pos, pos, 1,
+                        cache_nbmax, cfg.block_size, 0};
+    append_step(steps, "qkv_fused_gemv_int8",
+                {xq.取句柄(), sx.取句柄(),
+                 E.Wq_i8.取句柄(), E.Wq_s.取句柄(), E.Wk_i8.取句柄(), E.Wk_s.取句柄(),
+                 E.Wv_i8.取句柄(), E.Wv_s.取句柄(),
+                 E.q_cache.取句柄(), E.k_cache.取句柄(), E.v_cache.取句柄(),
+                 E.block_sum.取句柄(), qkv_norm.取句柄(),
+                 qkv_norm.取句柄(), qkv_norm.取句柄(), qkv_norm.取句柄()},
+                qk, H, 3, 1);
 }
 
 void Impl::append_qkv_decode(LayerDev& L, uint32_t pos,
@@ -1224,24 +1226,16 @@ void Impl::append_qkv_decode(LayerDev& L, uint32_t pos,
     const uint32_t H = cfg.n_heads, DK = cfg.d_k, DV = cfg.d_v;
     const uint32_t D = cfg.d_model;
     ERSADev& E = L.ersa_dev;
-    const QkvGemvPC pq{1, D, H, DK, DV, 1, 0, 0, 1,
-                       cache_nbmax, cfg.block_size, 0};
-    const QkvGemvPC pk{1, D, H, DK, DV, cache_cap, pos, 1, 1,
-                       cache_nbmax, cfg.block_size, 0};
-    const QkvGemvPC pv{1, D, H, DK, DV, cache_cap, pos, 2, 1,
-                       cache_nbmax, cfg.block_size, 0};
-    append_step(steps, "qkv_gemv_int8",
-                {xq.取句柄(), sx.取句柄(), E.Wq_i8.取句柄(), E.Wq_s.取句柄(),
-                 q_one.取句柄(), block_sum_dummy.取句柄(), qkv_norm.取句柄()},
-                pq, H, 1, 1);
-    append_step(steps, "qkv_gemv_int8",
-                {xq.取句柄(), sx.取句柄(), E.Wk_i8.取句柄(), E.Wk_s.取句柄(),
-                 E.dk_cache.取句柄(), E.block_sum.取句柄(), qkv_norm.取句柄()},
-                pk, H, 1, 1);
-    append_step(steps, "qkv_gemv_int8",
-                {xq.取句柄(), sx.取句柄(), E.Wv_i8.取句柄(), E.Wv_s.取句柄(),
-                 E.dv_cache.取句柄(), block_sum_dummy.取句柄(), qkv_norm.取句柄()},
-                pv, H, 1, 1);
+    const QkvFusedPC qk{1, D, H, DK, DV, 1, cache_cap, pos, 0, 1,
+                        cache_nbmax, cfg.block_size, 0};
+    append_step(steps, "qkv_fused_gemv_int8",
+                {xq.取句柄(), sx.取句柄(),
+                 E.Wq_i8.取句柄(), E.Wq_s.取句柄(), E.Wk_i8.取句柄(), E.Wk_s.取句柄(),
+                 E.Wv_i8.取句柄(), E.Wv_s.取句柄(),
+                 q_one.取句柄(), E.dk_cache.取句柄(), E.dv_cache.取句柄(),
+                 E.block_sum.取句柄(), qkv_norm.取句柄(),
+                 qkv_norm.取句柄(), qkv_norm.取句柄(), qkv_norm.取句柄()},
+                qk, H, 3, 1);
 }
 
 void Impl::append_ersa_prefill(LayerDev& L, uint32_t pos,
