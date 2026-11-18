@@ -24,6 +24,7 @@
 | `linear_fwd` / `linear_bwd_dx` / `linear_bwd_dwdb` | 线性层前向 / dX / dW+db |
 | `rmsnorm_fwd` / `rmsnorm_bwd_dx` / `rmsnorm_bwd_dw` | RMSNorm 前向 / 反向 |
 | `masked_softmax_bwd` / `fused_ce_bwd` | masked softmax 反向 / 融合交叉熵反向 |
+| `ce_stats_chunk64` / `ce_dlogits_chunk64` | 分块交叉熵：online max/sum + 逐块 dlogits；单次 dispatch 词表宽度与行数均 ≤64 |
 | `moe_bwd_dx` / `moe_bwd_dw_expert` / `moe_bwd_dw_shared` | MoE 反向三件套 |
 | `adamw_update` / `Adam参数更新` | AdamW 融合更新 / 原始拷贝件 |
 | `adamw_update_fp16` | AdamW 混合精度（fp16 参数/梯度 + fp32 master/m/v） |
