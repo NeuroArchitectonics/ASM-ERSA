@@ -159,13 +159,13 @@ int main(int argc, char** argv) {
         qd.上传(q.data(), q.size() * 4); kd.上传(k.data(), k.size() * 4);
         vd.上传(v.data(), v.size() * 4); bd.上传(bs.data(), bs.size() * 4);
         const ErsaPC pc{B, H, T, N, DK, DV, NB, BLOCK, TOPB, WINDOW, QOFF, NBMAX,
-                           (tau_arg > 0.0f) ? tau_arg : 1.0f, -30.0f};
+                           (tau_arg > 0.0f) ? tau_arg : 0.005f, -30.0f};
         run("ersa_attn_step", {qd.取句柄(), kd.取句柄(), vd.取句柄(),
                               bd.取句柄(), od.取句柄()},
             &pc, sizeof(pc), H, 1);
         std::vector<float> oh(H * DV);
         od.下载(oh.data(), oh.size() * 4);
-        std::printf("[ERSA recall tau=%.3g] target tokens:", (tau_arg > 0.0f) ? tau_arg : 1.0f);
+        std::printf("[ERSA recall tau=%.3g] target tokens:", (tau_arg > 0.0f) ? tau_arg : 0.005f);
         for (std::uint32_t h = 0; h < H; ++h)
             std::printf(" %u(mass=%.3f)", target[h], oh[h * DV]);
         std::printf("\n");
