@@ -47,6 +47,24 @@ void TrainerBridge::request_command(Command command) {
     cv_.notify_all();
 }
 
+void TrainerBridge::request_save(const std::string& path) {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (failed_) return;
+        save_path_ = path;
+        command_ = Command::Save;
+        done_ = false;
+    }
+    cv_.notify_all();
+}
+
+std::string TrainerBridge::take_save_path() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string path = std::move(save_path_);
+    save_path_.clear();
+    return path;
+}
+
 void TrainerBridge::publish(const AsmTrainerStats& stats) {
     {
         std::lock_guard<std::mutex> lock(mutex_);

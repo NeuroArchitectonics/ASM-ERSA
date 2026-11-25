@@ -9,13 +9,15 @@
 
 class TrainerBridge {
 public:
-    enum class Command { None, Step, Stop };
+    enum class Command { None, Step, Save, Stop };
 
     void mark_ready();
     void fail(const std::string& error);
     bool wait_ready();
     Command wait_command();
     void request_command(Command command);
+    void request_save(const std::string& path);
+    std::string take_save_path();
     void publish(const AsmTrainerStats& stats);
     void wait_result();
     AsmTrainerStats last_stats() const;
@@ -28,6 +30,7 @@ private:
     Command command_ = Command::None;
     AsmTrainerStats stats_{};
     std::string error_;
+    std::string save_path_;
     bool ready_ = false;
     bool done_ = false;
     bool failed_ = false;

@@ -18,6 +18,8 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--debug-bf16", action="store_true")
+    parser.add_argument("--save", type=Path, default=None,
+                        help="保存检查点路径：写 ASM8BIN 权重和同名 .opt 优化器状态")
     args = parser.parse_args()
 
     with Trainer(
@@ -38,6 +40,9 @@ def main() -> None:
             )
             latest = trainer.get_stats()
             print(f"get_stats step={latest.step} loss={latest.loss:.6f}")
+        if args.save is not None:
+            trainer.save_checkpoint(args.save)
+            print(f"checkpoint -> {args.save} (+ .opt)")
 
 
 if __name__ == "__main__":

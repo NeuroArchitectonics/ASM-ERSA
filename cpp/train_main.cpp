@@ -843,6 +843,171 @@ int main(int argc, char** argv) {
 
     if (big3b) 主 = asm_ersa_model::ModelWeights{};
 
+    std::uint64_t 已训步数 = 0;
+
+    // 检查点：<路径> 写 ASM8BIN 权重（推理侧可直接加载），<路径>.opt 写 Apollo/AdamW 状态
+    auto 保存权重 = [&](const std::string& 路径) {
+        struct BinHeader {
+            char magic[8];
+            std::uint32_t version;
+            std::uint32_t D, H, DK, DV, F, L, V_, E_, M_, TOPR, GROUP, BLOCK, TOPB, WINDOW, TOPK, TMAX;
+        };
+        BinHeader h{};
+        std::memcpy(h.magic, "ASM8BIN", 7);
+        h.version = 1;
+        h.D = D; h.H = H; h.DK = DK; h.DV = DV; h.F = F; h.L = cfg.n_layers;
+        h.V_ = V; h.E_ = E; h.M_ = M; h.TOPR = R; h.GROUP = 128;
+        h.BLOCK = cfg.block_size; h.TOPB = cfg.top_blocks; h.WINDOW = cfg.window;
+        h.TOPK = K; h.TMAX = Tmax;
+
+        std::ofstream wf(路径, std::ios::binary);
+        if (!wf) throw std::runtime_error("无法写入权重文件: " + 路径);
+        std::uint64_t 已写 = 0;
+        auto 写原始 = [&](const void* p, std::size_t bytes) {
+            wf.write(reinterpret_cast<const char*>(p), std::streamsize(bytes));
+            if (!wf) throw std::runtime_error("写权重失败: " + 路径);
+            已写 += bytes;
+        };
+        auto 写i8 = [&](const vk张量& t, std::size_t n) {
+            std::vector<std::int8_t> buf(n);
+            if (n) t.下载(buf.data(), n);
+            写原始(buf.data(), n);
+        };
+        auto 写f32 = [&](const vk张量& t, std::size_t n) {
+            std::vector<float> buf(n);
+            if (n) t.下载(buf.data(), n * sizeof(float));
+            写原始(buf.data(), n * sizeof(float));
+        };
+        auto 写标量 = [&](float v) { 写原始(&v, sizeof(float)); };
+        auto 写量化 = [&](参数* p) {
+            写i8(p->i8, p->n);
+            写f32(p->s, std::size_t(p->rows) * p->G);
+        };
+
+        写原始(&h, sizeof(h));
+        // embed 前向只读 scale 缓冲的前 V 个 float（flat 下标），写入同一段以保证前向等价
+        写i8(embed->i8, static_cast<std::size_t>(V) * D);
+        {
+            std::vector<float> s(static_cast<std::size_t>(V));
+            embed->s.下载(s.data(), s.size() * sizeof(float));
+            写原始(s.data(), s.size() * sizeof(float));
+        }
+        写i8(lmhead->i8, static_cast<std::size_t>(V) * D);
+        写f32(lmhead->s, std::size_t(V) * Gd);
+        写f32(finalNorm->p, D);
+
+        for (auto& L : 层表) {
+            auto 写GR = [&](参数* ng, 参数* rw, 参数* rb, 参数* ww, 参数* wb) {
+                写f32(ng->p, 4 * std::size_t(D));
+                写f32(rw->p, 4 * 4 * std::size_t(D));
+                写f32(rb->p, 4);
+                写f32(ww->p, 4 * std::size_t(D));
+                写f32(wb->p, 4);
+            };
+            写GR(L.g1ng, L.g1rw, L.g1rb, L.g1ww, L.g1wb);
+            写GR(L.g2ng, L.g2rw, L.g2rb, L.g2ww, L.g2wb);
+            写量化(L.Wq); 写量化(L.Wk); 写量化(L.Wv); 写量化(L.Wo);
+            if (L.ersa) {
+                写标量(L.sink_value);
+                写f32(L.outNorm->p, D);
+            } else {
+                写f32(L.etaW->p, D);
+                写f32(L.etaB->p, 1);
+                写f32(L.slotK->p, std::size_t(M) * DK);
+                写f32(L.gamma->p, M);
+                写标量(L.beta_null);
+                写f32(L.outNorm->p, D);
+            }
+            写f32(L.gate->p, std::size_t(E) * D);
+            写i8(L.moe_W1_i8, std::size_t(E) * F * D);
+            写f32(L.moe_W1_s, std::size_t(E) * F * Gd);
+            写i8(L.moe_W2_i8, std::size_t(E) * D * F);
+            写f32(L.moe_W2_s, std::size_t(E) * D * Gf);
+            写量化(L.shW1); 写量化(L.shWup); 写量化(L.shW2);
+        }
+        wf.close();
+        if (!wf) throw std::runtime_error("写权重失败: " + 路径);
+
+        const std::string 状态路径 = 路径 + ".opt";
+        std::ofstream of(状态路径, std::ios::binary);
+        if (!of) throw std::runtime_error("无法写入优化器状态: " + 状态路径);
+        auto wu32 = [&](std::uint32_t v) { of.write(reinterpret_cast<const char*>(&v), 4); };
+        auto wu64 = [&](std::uint64_t v) { of.write(reinterpret_cast<const char*>(&v), 8); };
+        auto wfv = [&](float v) { of.write(reinterpret_cast<const char*>(&v), 4); };
+        auto wfs = [&](const std::vector<float>& v) {
+            if (!v.empty()) of.write(reinterpret_cast<const char*>(v.data()), std::streamsize(v.size() * 4));
+        };
+        std::uint32_t 记录数 = 0;
+        for (auto& q : 全部参数) {
+            if (q->mini || q->miniI8 || q->m.布局().元素总数 > 0 ||
+                (q->量化 && q->p.布局().元素总数 > 0)) ++记录数;
+        }
+        of.write("ASMOPT01", 8);
+        wu32(1);
+        wu32(记录数);
+        wu64(已训步数);
+        wu64(已写);
+        wu32(模型seed);
+        wu32(128);
+        for (auto& q : 全部参数) {
+            std::uint32_t 标志 = 0;
+            const bool 有mv = q->m.布局().元素总数 > 0;
+            const bool 有mini = q->mini != nullptr;
+            const bool 有miniI8 = q->miniI8 != nullptr;
+            const bool 有master = q->量化 && q->p.布局().元素总数 > 0;
+            if (有mv) 标志 |= 1u;
+            if (有mini) 标志 |= 2u;
+            if (有miniI8) 标志 |= 4u;
+            if (有master) 标志 |= 8u;
+            if (标志 == 0) continue;
+            std::vector<float> P, Mv, Vv;
+            std::uint32_t 优化步数 = 0, 种子 = 0, 模式 = 0, 行 = 0, 列 = 0, G组 = 0;
+            float 上一范数 = 0.0f;
+            if (有mini) {
+                优化步数 = q->mini->步数(); 种子 = q->mini->种子(); 模式 = q->mini->模式();
+                行 = q->mini->行数(); 列 = q->mini->列数();
+                上一范数 = q->mini->上一缩放范数();
+                q->mini->导出状态(P, Mv, Vv);
+            } else if (有miniI8) {
+                优化步数 = q->miniI8->步数(); 种子 = q->miniI8->种子(); 模式 = q->miniI8->模式();
+                行 = q->miniI8->行数(); 列 = q->miniI8->列数(); G组 = q->miniI8->尺度组数();
+                上一范数 = q->miniI8->上一缩放范数();
+                q->miniI8->导出状态(P, Mv, Vv);
+            }
+            wu32(static_cast<std::uint32_t>(q->名.size()));
+            wu32(标志);
+            wu64(q->n);
+            wu32(优化步数);
+            wu32(种子);
+            wu32(模式);
+            wu32(行);
+            wu32(列);
+            wu32(G组);
+            wfv(上一范数);
+            wu32(static_cast<std::uint32_t>(P.size()));
+            wu32(static_cast<std::uint32_t>(Mv.size()));
+            of.write(q->名.data(), std::streamsize(q->名.size()));
+            if (有master) {
+                std::vector<float> buf(q->n);
+                q->p.下载(buf.data(), buf.size() * 4);
+                wfs(buf);
+            }
+            if (有mv) {
+                std::vector<float> buf(q->n);
+                q->m.下载(buf.data(), buf.size() * 4);
+                wfs(buf);
+                q->v.下载(buf.data(), buf.size() * 4);
+                wfs(buf);
+            }
+            wfs(P); wfs(Mv); wfs(Vv);
+        }
+        of.close();
+        if (!of) throw std::runtime_error("写优化器状态失败: " + 状态路径);
+        std::printf("检查点已保存: %s (%.2f GiB) | 优化器状态: %s | 步数=%llu | 记录=%u\n",
+                    路径.c_str(), double(已写) / (1024.0 * 1024.0 * 1024.0), 状态路径.c_str(),
+                    static_cast<unsigned long long>(已训步数), 记录数);
+    };
+
     // 全局前向缓冲
     vk张量 branches = 建({B, 4, D}, 张量类型::浮点32, "branches");
     vk张量 out_tokens = 建({Tmax, D}, 张量类型::浮点32, "out_tokens");
@@ -1980,13 +2145,23 @@ int main(int argc, char** argv) {
 
 #ifdef ASM_TRAINER_LIBRARY
     bridge.mark_ready();
-    std::uint64_t step = 0;
     for (;;) {
         const TrainerBridge::Command command = bridge.wait_command();
         if (command == TrainerBridge::Command::Stop) break;
         if (command == TrainerBridge::Command::None) continue;
+        if (command == TrainerBridge::Command::Save) {
+            try {
+                保存权重(bridge.take_save_path());
+            } catch (const std::exception& e) {
+                bridge.fail(e.what());
+            }
+            const AsmTrainerStats saved = bridge.last_stats();
+            bridge.publish(saved);
+            continue;
+        }
 
-        ++step;
+        ++已训步数;
+        const std::uint64_t step = 已训步数;
         const auto f0 = std::chrono::steady_clock::now();
         前向();
         const auto f1 = std::chrono::steady_clock::now();
@@ -2218,7 +2393,11 @@ int main(int argc, char** argv) {
                         const float l = 反向全部();
                         std::printf("[3b_train] s=%d upd\n", s + 1);
                         更新(1);
+                        ++已训步数;
                         std::printf("3b_train step %d loss=%.6f\n", s + 1, l);
+                    }
+                    if (const char* 保存路径 = std::getenv("ASM_SAVE")) {
+                        if (*保存路径) 保存权重(保存路径);
                     }
                     调度器.停止();
                     return 0;
@@ -2474,12 +2653,17 @@ int main(int argc, char** argv) {
         清零梯度();
         反向全部();
         更新(1);
+        ++已训步数;
         for (int step = 2; step <= 步数; ++step) {
             前向();
             清零梯度();
             const float l = 反向全部();
             std::printf("step %3d loss=%.6f\n", step - 1, l);
             更新(std::uint32_t(step));
+            ++已训步数;
+        }
+        if (const char* 保存路径 = std::getenv("ASM_SAVE")) {
+            if (*保存路径) 保存权重(保存路径);
         }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "前向失败: %s\n", e.what());

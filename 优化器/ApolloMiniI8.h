@@ -37,7 +37,21 @@ public:
     std::uint32_t 行数() const { return rows_; }
     std::uint32_t 列数() const { return cols_; }
     std::uint32_t 低秩长度() const { return R_len_; }
+    std::uint32_t 步数() const { return 步数_; }
+    std::uint32_t 种子() const { return seed_; }
+    std::uint32_t 模式() const { return mode_; }
+    std::uint32_t 尺度组数() const { return G_; }
+    float 上一缩放范数() const { return 上一缩放范数_; }
     const std::vector<float>& 投影() const { return Phost_; }
+    void 导出状态(std::vector<float>& P, std::vector<float>& M,
+                 std::vector<float>& V) const {
+        P.resize(inner_);
+        M.resize(R_len_);
+        V.resize(R_len_);
+        if (!P.empty()) P_.下载(P.data(), P.size() * sizeof(float));
+        if (!M.empty()) M_.下载(M.data(), M.size() * sizeof(float));
+        if (!V.empty()) V_.下载(V.data(), V.size() * sizeof(float));
+    }
 
 private:
     void 刷新投影();
