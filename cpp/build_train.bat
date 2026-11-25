@@ -23,8 +23,8 @@ for %%F in (linear_bwd_dx linear_bwd_dwdb rmsnorm_bwd_dx rmsnorm_bwd_dw ^
 )
 
 cl /nologo /std:c++20 /EHsc /utf-8 /O2 /MD /D_CRT_SECURE_NO_WARNINGS ^
-   /I "%ROOT%." /I "%ROOT%spv" /I "%PRJ%\spv" /I "%PRJ%" /I "%PRJ%\ASM-ERSA-Design\vk" /I "%VKSDK%\Include" ^
-   "%ROOT%train_main.cpp" "%ROOT%asm_ersa_model.cpp" "%ROOT%cpu_reference.cpp" ^
+   /I "%ROOT%." /I "%ROOT%spv" /I "%PRJ%\spv" /I "%PRJ%" /I "%PRJ%\3911~1" /I "%PRJ%\ASM-ERSA-Design\vk" /I "%VKSDK%\Include" ^
+   "%ROOT%train_main.cpp" "%ROOT%asm_ersa_model.cpp" "%ROOT%cpu_reference.cpp" "%PRJ%\3911~1\ApolloMini.cpp" "%PRJ%\3911~1\ApolloMiniI8.cpp" ^
    /Fe:"%ROOT%build\train_main.exe" ^
    /Fo:"%ROOT%build\\" ^
    /link /LIBPATH:"%VKSDK%\Lib" vulkan-1.lib

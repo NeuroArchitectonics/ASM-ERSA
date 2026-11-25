@@ -30,6 +30,52 @@ struct ModelConfig {
     uint32_t max_seq_len = 16;
 };
 
+// 6B-lite 预设（与 Python 侧 TrainConfig6BLite 同构）：
+// D=2048/F=384 不变，24 层、138 专家 top-4、tied embedding。
+// 目标：总参 ~5.99B、每 token 激活 ~0.93B（VK 主干口径，不含多模态头）。
+inline ModelConfig ModelConfig6BLite() {
+    ModelConfig c;
+    c.d_model = 2048;
+    c.n_heads = 16;
+    c.d_k = 128;
+    c.d_v = 128;
+    c.d_ff = 384;
+    c.n_layers = 24;
+    c.vocab_size = 152064;
+    c.n_slots = 512;
+    c.top_r = 16;
+    c.n_scales = 4;
+    c.block_size = 64;
+    c.top_blocks = 4;
+    c.window = 64;
+    c.sketch_dim = 32;
+    c.n_experts = 138;
+    c.moe_top_k = 4;
+    c.max_seq_len = 16;
+    return c;
+}
+
+// 参数统计：与 make_random_weights 的 shape 一致；tied_embed=true 时 lm_head 与词嵌入共用一份。
+inline std::uint64_t count_params(const ModelConfig& c, bool tied_embed = true) {
+    const std::uint64_t D = c.d_model, H = c.n_heads, DK = c.d_k, DV = c.d_v;
+    const std::uint64_t F = c.d_ff, V = c.vocab_size, E = c.n_experts, M = c.n_slots, L = c.n_layers;
+    const std::uint64_t gr = 4 * D + 4 * 4 * D + 4 + 4 * D + 4;
+    const std::uint64_t asm_w = 4 * (H * DK * D) + D + 1 + M * DK + M + D;
+    const std::uint64_t ersa_w = 4 * (H * DK * D) + D + 1;
+    const std::uint64_t moe = E * D + 2 * (E * D * F) + 3 * (F * D);
+    const std::uint64_t n_ersa = L / 4, n_asm = L - n_ersa;
+    return L * 2 * gr + n_asm * asm_w + n_ersa * ersa_w + L * moe
+           + (tied_embed ? 1u : 2u) * V * D + D;
+}
+
+// 每 token 激活参数：全部非专家 + moe_top_k/E 的专家
+inline std::uint64_t count_active_params(const ModelConfig& c, bool tied_embed = true) {
+    const std::uint64_t D = c.d_model, F = c.d_ff, E = c.n_experts, L = c.n_layers;
+    const std::uint64_t expert = L * 2 * E * D * F;
+    const std::uint64_t tot = count_params(c, tied_embed);
+    return tot - expert + expert * c.moe_top_k / E;
+}
+
 struct GRWeights {
     std::vector<float> norm_g[4];
     std::vector<float> read_w;

@@ -30,6 +30,9 @@
 #include "spv/fused_ce_bwd.spv.hpp"
 #include "spv/embedding_bwd.spv.hpp"
 #include "cpp/spv/embedding_bwd_scatter.spv.hpp"
+#include "cpp/spv/embedding_bwd_scatter_partial.spv.hpp"
+#include "cpp/spv/embedding_bwd_partial_to_bf16.spv.hpp"
+#include "cpp/spv/linear_bwd_dwdb_bf16.spv.hpp"
 #include "spv/moe_bwd_dx.spv.hpp"
 #include "cpp/spv/moe_bwd_dx_q.spv.hpp"
 #include "cpp/spv/moe_bwd_dx_i8.spv.hpp"
@@ -43,6 +46,28 @@
 #include "cpp/spv/moe_bwd_dw_shared_q.spv.hpp"
 #include "cpp/spv/moe_bwd_dw_shared_i8.spv.hpp"
 #include "spv/adamw_update.spv.hpp"
+#include "spv/apollo_reduce.spv.hpp"
+#include "spv/apollo_update.spv.hpp"
+#include "cpp/spv/apollo_mini_proj.spv.hpp"
+#include "cpp/spv/apollo_mini_stat.spv.hpp"
+#include "cpp/spv/apollo_mini_apply.spv.hpp"
+#include "cpp/spv/apollo_mini_apply_i8.spv.hpp"
+#include "cpp/spv/moe_i8_transpose.spv.hpp"
+#include "cpp/spv/moe_quant_w.spv.hpp"
+#include "cpp/spv/linear_bwd_dwdb5_bf16.spv.hpp"
+#include "cpp/spv/moe_bwd_dw_all_i8_bf16.spv.hpp"
+#include "cpp/spv/moe_bwd_dw_expert_i8_bf16.spv.hpp"
+#include "cpp/spv/moe_bwd_dw_shared_i8_bf16.spv.hpp"
+#include "cpp/spv/apollo_mini_proj_bf16.spv.hpp"
+#include "cpp/spv/apollo_mini_gnorm_bf16.spv.hpp"
+#include "cpp/spv/apollo_mini_apply_i8_bf16.spv.hpp"
+#include "cpp/spv/apollo_mini_apply_moe_i8.spv.hpp"
+#include "cpp/spv/apollo_mini_apply_moe_i8_bf16.spv.hpp"
+#include "cpp/spv/apollo_mini_apply_bf16.spv.hpp"
+#include "cpp/spv/adamw_update_bf16.spv.hpp"
+#include "cpp/spv/apollo_mini_gnorm.spv.hpp"
+#include "ApolloMini.h"
+#include "ApolloMiniI8.h"
 #include "cpp/spv/gr_read_bwd_int8.spv.hpp"
 #include "cpp/spv/gr_read_post_seq.spv.hpp"
 #include "cpp/spv/gr_route_bwd_int8.spv.hpp"
@@ -51,6 +76,8 @@
 #include "cpp/spv/asm_step_bwd_multi.spv.hpp"
 #include "cpp/spv/asm_step_bwd_seq.spv.hpp"
 #include "cpp/spv/asm_step_bwd_seq_wg.spv.hpp"
+#include "cpp/spv/asm_step_eta_bf16.spv.hpp"
+#include "cpp/spv/asm_step_bwd_seq_wg_bf16.spv.hpp"
 #include "cpp/spv/ersa_attn_bwd_query.spv.hpp"
 #include "cpp/spv/ersa_ivf_attn_query.spv.hpp"
 #include "cpp/spv/ersa_ivf_attn_bwd_query.spv.hpp"
@@ -110,6 +137,17 @@ struct 规格Adam {
     float wd;
     std::uint32_t zero_grad;
 };
+struct 规格Apollo归约 {
+    std::uint32_t size;
+    float beta, c1, c2;
+    std::uint32_t init_b, pad0, pad1, pad2;
+};
+struct 规格Apollo更新 {
+    std::uint32_t size;
+    float alpha, lr, sigma, b_max, pad0, pad1, pad2;
+};
+static_assert(sizeof(规格Apollo归约) == 32, "apollo_reduce push");
+static_assert(sizeof(规格Apollo更新) == 32, "apollo_update push");
 struct GRReadPC { std::uint32_t B, D, T, t, first, pad0, pad1, pad2; };
 struct GrPostPC { std::uint32_t T, D, first, pad0; };
 struct QkvFusedPC {
@@ -214,8 +252,16 @@ vk张量 建零(std::uint32_t n, const char* 名) {
     return t;
 }
 void 填(vk张量& t, float v) {
-    std::vector<float> d(static_cast<std::size_t>(t.布局().元素总数), v);
-    t.上传(d.data(), d.size() * 4);
+    const std::size_t n = static_cast<std::size_t>(t.布局().元素总数);
+    if (t.类型() == 张量类型::浮点bf16) {
+        std::uint32_t u = 0;
+        std::memcpy(&u, &v, 4);
+        std::vector<std::uint16_t> d(n, static_cast<std::uint16_t>(u >> 16));
+        t.上传(d.data(), n * 2);
+    } else {
+        std::vector<float> d(n, v);
+        t.上传(d.data(), n * 4);
+    }
 }
 void 填零(vk张量& t) { 填(t, 0.0f); }
 std::vector<vk张量> 建双份(std::vector<std::uint32_t> 形状, 张量类型 类型,
@@ -229,9 +275,13 @@ std::vector<vk张量> 建双份(std::vector<std::uint32_t> 形状, 张量类型 
 
 struct 参数 {
     vk张量 p, g, m, v, i8, s;
+    vk张量 b, d;   // Apollo 的对角曲率 B 与更新方向 d（仅 ASM_OPT=apollo 时分配）
+    std::unique_ptr<ApolloMini> mini;   // APOLLO-Mini 低秩状态（仅 ASM_OPT=apollo_mini 且 ndim>=2）
+    std::unique_ptr<ApolloMiniI8> miniI8;  // INT8 直写（仅 ASM_PARAM=i8 且量化矩阵）
     std::uint32_t n = 0;
     std::uint32_t rows = 0, cols = 0, G = 0;
     bool 量化 = false;
+    bool 梯度bf16 = false;
     std::string 名;
 };
 
@@ -269,8 +319,40 @@ int main(int argc, char** argv) {
     const std::string spv目录 = argv[1];
     const std::string 模式 = (argc >= 3) ? argv[2] : "";
     const bool smoke = (模式 == "smoke");
-    const bool big3b = (模式 == "3b_cache" || 模式 == "3b_cache_smoke");
+    const bool big6b = (模式 == "6b_cache" || 模式 == "6b_train");
+    const bool big3b = (模式 == "3b_cache" || 模式 == "3b_cache_smoke" || 模式 == "3b_train" || big6b);
+    // 训练循环（每步 fwd/bwd/upd）：3b_train / 6b_train 共用
+    const bool 训练循环 = (模式 == "3b_train" || 模式 == "6b_train");
     const int 步数 = smoke ? 0 : ((argc >= 3) ? std::atoi(argv[2]) : 4);
+
+    // 优化器选择：ASM_OPT=apollo 走 VK Apollo（m/B/d 常驻），否则 AdamW。
+    const char* opt_env = std::getenv("ASM_OPT");
+    const bool 用Apollo优化器 = (opt_env != nullptr && std::string(opt_env) == "apollo");
+    const bool 用ApolloMini = (opt_env != nullptr && std::string(opt_env) == "apollo_mini");
+    // ASM_PARAM=i8：量化矩阵只保留 INT8 一份（无 fp32 master），更新走 apollo_mini_apply_i8。
+    const char* param_env = std::getenv("ASM_PARAM");
+    const bool 用I8参数 = (param_env != nullptr && std::string(param_env) == "i8");
+    const char* moe_master_env = std::getenv("ASM_MOE_I8_MASTER");
+    const bool 保留MoEMaster = (moe_master_env != nullptr && std::string(moe_master_env) == "1");
+    const bool 用MoE直写 = big3b && 用I8参数 && !保留MoEMaster;
+    const char* old_f32_env = std::getenv("ASM_OLD_STATE_F32");
+    const bool 用Bf16旧状态 = big3b && !(old_f32_env != nullptr && std::string(old_f32_env) == "1");
+    // ASM_GRAD=bf16（默认）：一次写定的矩阵梯度存 bf16；词表梯度可用 fp32 partial 后 cast。
+    const char* grad_env = std::getenv("ASM_GRAD");
+    const bool 用Bf16梯度 = (grad_env == nullptr || std::string(grad_env) == "bf16");
+    const char* word_f32_env = std::getenv("ASM_WORD_GRAD_F32");
+    const bool 用Bf16词表梯度 = big3b && 用Bf16梯度 &&
+                              !(word_f32_env != nullptr && std::string(word_f32_env) == "1");
+    const char* ap_lr_env = std::getenv("ASM_APOLLO_LR");
+    const char* ap_sg_env = std::getenv("ASM_APOLLO_SIGMA");
+    const char* ap_bm_env = std::getenv("ASM_APOLLO_BMAX");
+    const float apollo_lr = ap_lr_env ? static_cast<float>(std::atof(ap_lr_env)) : 3e-4f;
+    const float apollo_sigma = ap_sg_env ? static_cast<float>(std::atof(ap_sg_env)) : 1e-4f;
+    const float apollo_bmax = ap_bm_env ? static_cast<float>(std::atof(ap_bm_env)) : 3.402823466e38f;
+    const char* ad_lr_env = std::getenv("ASM_ADAMW_LR");
+    const float adamw_lr = ad_lr_env ? static_cast<float>(std::atof(ad_lr_env)) : 3e-4f;
+    const char* mini_scale_env = std::getenv("ASM_APOLLO_MINI_SCALE");
+    const float mini_scale = mini_scale_env ? static_cast<float>(std::atof(mini_scale_env)) : 128.0f;
 
     asm_ersa_model::ModelConfig cfg;
     cfg.d_model = 32;
@@ -309,6 +391,7 @@ int main(int argc, char** argv) {
         cfg.moe_top_k = 4;
         cfg.max_seq_len = 16;
     }
+    if (big6b) cfg = asm_ersa_model::ModelConfig6BLite();   // 24 层 / 138 专家 / top-4
 
     // cache0/cachefull：无 context / 全候选，用同一候选集对拍 block/cache。
     const bool parity0 = (模式 == "cache0" || 模式 == "cache0_smoke");
@@ -372,7 +455,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    asm_ersa_model::ModelWeights 主 = asm_ersa_model::make_random_weights(cfg, 20261118u);
+    const char* seed_env = std::getenv("ASM_SEED");
+    const std::uint32_t 模型seed = seed_env ? static_cast<std::uint32_t>(std::atoi(seed_env)) : 20261118u;
+    asm_ersa_model::ModelWeights 主 = asm_ersa_model::make_random_weights(cfg, 模型seed);
 
     std::vector<std::unique_ptr<参数>> 全部参数;
     auto 加参数 = [&](std::vector<std::uint32_t> 形状, const std::vector<float>& 初值,
@@ -383,12 +468,53 @@ int main(int argc, char** argv) {
         q->n = 1;
         for (auto v : 形状) q->n *= v;
         if (初值.size() != q->n) throw std::runtime_error("初值大小不匹配: " + 名);
-        q->p = 建(形状, 张量类型::浮点32, (名 + ".p").c_str());
-        q->p.上传(初值.data(), 初值.size() * 4);
-        q->g = 建零(q->n, (名 + ".g").c_str());
-        if (!big3b) {
+        // ASM_PARAM=i8：量化矩阵只留 INT8；W1/W2 默认直写前向布局，旧 master 路径仅用于回退对照。
+        const bool 是MoE大权 = 名.find(".W1") != std::string::npos || 名.find(".W2") != std::string::npos;
+        const bool MoE直写 = 用MoE直写 && 是MoE大权;
+        const bool i8直存 = 用I8参数 && 量化 && 形状.size() >= 2;
+        if (!i8直存 && !MoE直写) {
+            q->p = 建(形状, 张量类型::浮点32, (名 + ".p").c_str());
+            q->p.上传(初值.data(), 初值.size() * 4);
+        }
+        const bool 是词表权 = 名.find("embed") != std::string::npos || 名.find("lm_head") != std::string::npos;
+        // 一次写定的线性/MoE 权重用 bf16；词表梯度由专用内核写入，embed 先 fp32 partial 累加。
+        const bool 是线性四权 = 名.find(".Wo") != std::string::npos || 名.find(".Wq") != std::string::npos ||
+                               名.find(".Wk") != std::string::npos || 名.find(".Wv") != std::string::npos;
+        const bool 是MoE权 = 名.find(".W1") != std::string::npos || 名.find(".W2") != std::string::npos ||
+                            名.find(".shW") != std::string::npos;
+        // ASM_BF16_SCOPE=linear|moe|all（默认 all），用于隔离 bf16 各段
+        const char* 范围env = std::getenv("ASM_BF16_SCOPE");
+        const std::string 范围 = 范围env ? 范围env : "all";
+        const bool 允许线性 = (范围 == "all" || 范围 == "linear");
+        const bool 允许MoE = (范围 == "all" || 范围 == "moe");
+        q->梯度bf16 = 用Bf16梯度 &&
+                      ((用Bf16词表梯度 && 是词表权) ||
+                       (!是词表权 && ((是线性四权 && 量化 && 允许线性) || (是MoE权 && 允许MoE))));
+        q->g = q->梯度bf16 ? 建(形状, 张量类型::浮点bf16, (名 + ".g").c_str())
+                           : 建零(q->n, (名 + ".g").c_str());
+        if ((!big3b || !量化) && !MoE直写) {
             q->m = 建零(q->n, (名 + ".m").c_str());
             q->v = 建零(q->n, (名 + ".v").c_str());
+            if (用Apollo优化器) {
+                q->b = 建零(q->n, (名 + ".b").c_str());
+                q->d = 建零(q->n, (名 + ".d").c_str());
+            }
+        }
+        // 旧 master 路径用低秩 ApolloMini 替代 AdamW 的 m/v；直写路径在层缓冲建好后绑定 miniI8。
+        if (用ApolloMini && !MoE直写 && (!big3b || 用I8参数 || 训练循环) && 形状.size() >= 2 &&
+            !i8直存 && (!是MoE大权 || 用I8参数)) {
+            const std::uint32_t cols = 形状.back();
+            std::uint32_t rows = 1;
+            for (std::size_t i = 0; i + 1 < 形状.size(); ++i) rows *= 形状[i];
+            // 行数太小的矩阵（如 GR 的 [4, 4D]）低秩投影信息不足、s 爆炸，回退 AdamW
+            if (rows >= 8 && cols >= 8) {
+                ApolloMini::配置 mc;
+                mc.学习率 = adamw_lr;
+                mc.scale = mini_scale;
+                q->mini = std::make_unique<ApolloMini>(q->p, q->g, rows, cols, mc,
+                                                       20261123u + 模型seed + static_cast<std::uint32_t>(q->n),
+                                                       q->梯度bf16);
+            }
         }
         if (量化) {
             q->量化 = true;
@@ -397,6 +523,19 @@ int main(int argc, char** argv) {
             q->G = (cols + 127u) / 128u;
             q->i8 = 建({rows, cols}, 张量类型::整数8, (名 + ".i8").c_str(), true);
             q->s = 建({rows, q->G}, 张量类型::浮点32, (名 + ".s").c_str(), true);
+            if (i8直存 && rows >= 8 && cols >= 8) {
+                ApolloMiniI8::配置 mc;
+                mc.学习率 = adamw_lr;
+                mc.scale = mini_scale;
+                q->miniI8 = std::make_unique<ApolloMiniI8>(q->i8, q->s, q->g, rows, cols, mc,
+                                                           20261124u + 模型seed + static_cast<std::uint32_t>(q->n),
+                                                           q->G, q->梯度bf16);
+            }
+        }
+        if (q->mini || q->miniI8) {
+            // 低秩优化器不需要 AdamW 的 m/v（每个 4 B/param）；MoE 的 W1/W2 靠这一步省下 12.9 GB 量级
+            q->m = vk张量();
+            q->v = vk张量();
         }
         参数* 结果 = q.get();
         全部参数.push_back(std::move(q));
@@ -524,8 +663,10 @@ int main(int argc, char** argv) {
             asmKAll[li] = 建({T, HDK}, 张量类型::浮点32, pre + "k");
             asmVAll[li] = 建({T, HDV}, 张量类型::浮点32, pre + "v");
             asmEtaAll[li] = 建({T, B}, 张量类型::浮点32, pre + "eta");
-            asmKOldAll[li] = 建({T, B * H * M * DK}, 张量类型::浮点32, pre + "Kold");
-            asmVOldAll[li] = 建({T, B * H * M * DV}, 张量类型::浮点32, pre + "Vold");
+            asmKOldAll[li] = 建({T, B * H * M * DK},
+                                 用Bf16旧状态 ? 张量类型::浮点bf16 : 张量类型::浮点32, pre + "Kold");
+            asmVOldAll[li] = 建({T, B * H * M * DV},
+                                 用Bf16旧状态 ? 张量类型::浮点bf16 : 张量类型::浮点32, pre + "Vold");
             asmBoldAll[li] = 建({T, B * H * M}, 张量类型::浮点32, pre + "Bold");
             asmIdxAll[li] = 建({T, B * H * (3 * R + 1)}, 张量类型::浮点32, pre + "idx");
             asmXqAll[li] = 建({T, D}, 张量类型::整数8, pre + "xq");
@@ -569,7 +710,7 @@ int main(int argc, char** argv) {
         L.gate = 加参数({E, D}, lw.moe.gate, "L" + std::to_string(li) + ".gate");
         L.W1 = 加参数({E * D, F}, lw.moe.W1, "L" + std::to_string(li) + ".W1");
         L.W2 = 加参数({E * F, D}, lw.moe.W2, "L" + std::to_string(li) + ".W2");
-        if (big3b) {
+        if (big3b && !用I8参数) {
             // 3B 只测 cache 前向/反向，不更新权重；int8 直读路径不再需要
             // routed MoE 的 FP32 master，释放两份 6.4GB 级缓冲。
             L.W1->p = vk张量();
@@ -596,6 +737,21 @@ int main(int argc, char** argv) {
             L.moe_W1_s.上传(s1.data(), s1.size() * 4);
             L.moe_W2_i8.上传(q2.data(), q2.size());
             L.moe_W2_s.上传(s2.data(), s2.size() * 4);
+            if (用MoE直写) {
+                ApolloMiniI8::配置 mc;
+                mc.学习率 = adamw_lr;
+                mc.scale = mini_scale;
+                const std::uint32_t seed1 = 20261124u + 模型seed + L.W1->n;
+                const std::uint32_t seed2 = 20261124u + 模型seed + L.W2->n;
+                L.W1->miniI8 = std::make_unique<ApolloMiniI8>(
+                    L.moe_W1_i8, L.moe_W1_s, L.W1->g, E * D, F, mc, seed1,
+                    (D + 127u) / 128u, L.W1->梯度bf16,
+                    ApolloMiniI8::MoE直写布局{E, F, D, 1u});
+                L.W2->miniI8 = std::make_unique<ApolloMiniI8>(
+                    L.moe_W2_i8, L.moe_W2_s, L.W2->g, E * F, D, mc, seed2,
+                    (F + 127u) / 128u, L.W2->梯度bf16,
+                    ApolloMiniI8::MoE直写布局{E, F, D, 2u});
+            }
         }
 
         // 层状态/历史
@@ -701,6 +857,29 @@ int main(int argc, char** argv) {
     }
     ids.上传(idsAll.data(), idsAll.size() * 4);
     targets.上传(th.data(), th.size() * 4);
+
+    vk张量 embedPartial, embedUniqueIds, embedTokenMap;
+    std::uint32_t embedU = 0;
+    if (用Bf16词表梯度) {
+        std::vector<std::int32_t> unique;
+        unique.reserve(T);
+        std::vector<std::int32_t> tokenMap(T);
+        for (std::uint32_t t = 0; t < T; ++t) {
+            auto it = std::find(unique.begin(), unique.end(), idsAll[t]);
+            if (it == unique.end()) {
+                unique.push_back(idsAll[t]);
+                tokenMap[t] = static_cast<std::int32_t>(unique.size() - 1);
+            } else {
+                tokenMap[t] = static_cast<std::int32_t>(it - unique.begin());
+            }
+        }
+        embedU = static_cast<std::uint32_t>(unique.size());
+        embedPartial = 建({embedU, D}, 张量类型::浮点32, "bwd.embed_partial");
+        embedUniqueIds = 建({embedU}, 张量类型::整数32, "bwd.embed_unique_ids");
+        embedTokenMap = 建({T}, 张量类型::整数32, "bwd.embed_token_map");
+        embedUniqueIds.上传(unique.data(), unique.size() * 4);
+        embedTokenMap.上传(tokenMap.data(), tokenMap.size() * 4);
+    }
 
     vk张量 ivfAssignNew, ivfOverflow;
     if (cache_mode) {
@@ -818,7 +997,6 @@ int main(int argc, char** argv) {
     vk张量 out_q = 建({Tq, D}, 张量类型::浮点32, "out_q");
     vk张量 dOutTokens = 建({T, D}, 张量类型::浮点32, "dOutTokens");
     vk张量 dFinalNorm = 建({D}, 张量类型::浮点32, "dFinalNorm");
-    vk张量 dLmHead = 建({V, D}, 张量类型::浮点32, "dLmHead");
     vk张量 dLmHeadDb = 建({V}, 张量类型::浮点32, "dLmHeadDb");
     vk张量 normed_f32 = 建({Tq, D}, 张量类型::浮点32, "normed_f32");
     vk张量 zero_TD = 建({T, D}, 张量类型::浮点32, "zero_TD");
@@ -845,10 +1023,22 @@ int main(int argc, char** argv) {
         return 出;
     };
     auto 范数 = [&](const vk张量& t) {
-        std::vector<float> v(static_cast<std::size_t>(t.布局().元素总数));
-        t.下载(v.data(), v.size() * 4);
+        const std::size_t n = static_cast<std::size_t>(t.布局().元素总数);
         double s = 0.0;
-        for (float x : v) s += double(x) * x;
+        if (t.类型() == 张量类型::浮点bf16) {
+            std::vector<std::uint16_t> h(n);
+            t.下载(h.data(), n * 2);
+            for (auto v : h) {
+                const std::uint32_t u = std::uint32_t(v) << 16;
+                float f = 0.0f;
+                std::memcpy(&f, &u, 4);
+                s += double(f) * f;
+            }
+        } else {
+            std::vector<float> v(n);
+            t.下载(v.data(), n * 4);
+            for (float x : v) s += double(x) * x;
+        }
         return float(std::sqrt(s));
     };
 
@@ -871,9 +1061,9 @@ int main(int argc, char** argv) {
               &dq, sizeof(dq), (Tq * D + 255u) / 256u, 1, 1);
 
         const 规格4 lw{Tq, D, V, 0};
-        提交2("linear_bwd_dwdb",
+        提交2(lmhead->梯度bf16 ? "linear_bwd_dwdb_bf16" : "linear_bwd_dwdb",
               {normed_f32.取句柄(), dlogits.取句柄(), lmhead->g.取句柄(), dLmHeadDb.取句柄()},
-              &lw, sizeof(lw), (V * D + 63u) / 64u, 1, 1);
+              &lw, sizeof(lw), (V * D + 63u) / 64u, 1u, 1u);
         const LinI8PC lhi{Tq, D, V, Gd, 0, 0, 0, 0};
         提交2("linear_bwd_dx_i8",
               {dlogits.取句柄(), lmhead->i8.取句柄(), lmhead->s.取句柄(),
@@ -905,29 +1095,11 @@ int main(int argc, char** argv) {
     // ── 反向工作张量（逐 token 复用；参数梯度累加进 参数::g）──
     auto dYAllV = 建双份({T, D}, 张量类型::浮点32, "bwd.dYAll");
     auto dBranchMidAllV = 建双份({T, 4, D}, 张量类型::浮点32, "bwd.dBmidAll");
-    auto dW2wV = 建双份({4, D}, 张量类型::浮点32, "bwd.dW2w");
-    auto db2wV = 建双份({4}, 张量类型::浮点32, "bwd.db2w");
     vk张量 dW2wAll = 建({T, 4, D}, 张量类型::浮点32, "bwd.dW2wAll");
     vk张量 db2wAll = 建({T, 4}, 张量类型::浮点32, "bwd.db2wAll");
     auto dX2AllV = 建双份({T, D}, 张量类型::浮点32, "bwd.dX2All");
     auto dScoreAllV = 建双份({T, E}, 张量类型::浮点32, "bwd.dScoreAll");
-    vk张量 dGateW = 建({E, D}, 张量类型::浮点32, "bwd.dGateW");
     vk张量 dGateDb = 建({E}, 张量类型::浮点32, "bwd.dGateDb");
-    auto dW1V = 建双份({E * D, F}, 张量类型::浮点32, "bwd.dW1");
-    auto dW2V = 建双份({E * F, D}, 张量类型::浮点32, "bwd.dW2");
-    auto dShW1TV = 建双份({D, F}, 张量类型::浮点32, "bwd.dShW1T");
-    auto dShWupTV = 建双份({D, F}, 张量类型::浮点32, "bwd.dShWupT");
-    auto dShW2TV = 建双份({F, D}, 张量类型::浮点32, "bwd.dShW2T");
-    auto dShW1V = 建双份({F, D}, 张量类型::浮点32, "bwd.dShW1");
-    auto dShWupV = 建双份({F, D}, 张量类型::浮点32, "bwd.dShWup");
-    auto dShW2V = 建双份({D, F}, 张量类型::浮点32, "bwd.dShW2");
-
-    vk张量 dOutNorm = 建({D}, 张量类型::浮点32, "bwd.dOutNorm");
-    vk张量 dW1W = 建({4, D}, 张量类型::浮点32, "bwd.dW1W");
-    vk张量 dW1B = 建({4}, 张量类型::浮点32, "bwd.dW1B");
-    vk张量 dG2G = 建({4, D}, 张量类型::浮点32, "bwd.dG2G");
-    vk张量 dG2W = 建({4, 4 * D}, 张量类型::浮点32, "bwd.dG2W");
-    vk张量 dG2B = 建({4}, 张量类型::浮点32, "bwd.dG2B");
     vk张量 dWoYAll = 建({T, D}, 张量类型::浮点32, "bwd.dWoYAll");
     vk张量 dOAll = 建({T, HDV}, 张量类型::浮点32, "bwd.dOAll");
     vk张量 dBranchRAll = 建({T, 4, D}, 张量类型::浮点32, "bwd.dBrouteAll");
@@ -937,7 +1109,6 @@ int main(int argc, char** argv) {
     vk张量 dG2GAll = 建({T, 4, D}, 张量类型::浮点32, "bwd.dG2GAll");
     vk张量 dG2WAll = 建({T, 4, 4 * D}, 张量类型::浮点32, "bwd.dG2WAll");
     vk张量 dG2BAll = 建({T, 4}, 张量类型::浮点32, "bwd.dG2BAll");
-    vk张量 dWo = 建({D, HDV}, 张量类型::浮点32, "bwd.dWo");
     vk张量 dWoDb = 建({D}, 张量类型::浮点32, "bwd.dWoDb");
 
     vk张量 dKnSeq = 建({B, H, M, DK}, 张量类型::浮点32, "bwd.dKnSeq");
@@ -946,16 +1117,10 @@ int main(int argc, char** argv) {
     vk张量 dbnH = 建({H}, 张量类型::浮点32, "bwd.dbnH");
     vk张量 dgammaH = 建({H, M}, 张量类型::浮点32, "bwd.dgammaH");
     vk张量 dGamma = 建({M}, 张量类型::浮点32, "bwd.dGamma");
-    vk张量 dWq = 建({HDK, D}, 张量类型::浮点32, "bwd.dWq");
-    vk张量 dWk = 建({HDK, D}, 张量类型::浮点32, "bwd.dWk");
-    vk张量 dWv = 建({HDV, D}, 张量类型::浮点32, "bwd.dWv");
     vk张量 dWqDb = 建({HDK}, 张量类型::浮点32, "bwd.dWqDb");
     vk张量 dWkDb = 建({HDK}, 张量类型::浮点32, "bwd.dWkDb");
     vk张量 dWvDb = 建({HDV}, 张量类型::浮点32, "bwd.dWvDb");
 
-    vk张量 dNormG = 建({4, D}, 张量类型::浮点32, "bwd.dNormG");
-    vk张量 dReadW = 建({4, 4 * D}, 张量类型::浮点32, "bwd.dReadW");
-    vk张量 dReadB = 建({4}, 张量类型::浮点32, "bwd.dReadB");
     vk张量 dEtaW = 建({D}, 张量类型::浮点32, "bwd.dEtaW");
     vk张量 dEtaB = 建({1}, 张量类型::浮点32, "bwd.dEtaB");
     vk张量 dInAll = 建({T, 4, D}, 张量类型::浮点32, "bwd.dInAll");
@@ -968,7 +1133,6 @@ int main(int argc, char** argv) {
     vk张量 dEtaZero = 建({T, H}, 张量类型::浮点32, "bwd.dEtaZero");
     填零(dEtaZero);
     vk张量 dEmbedAll = 建({T, D}, 张量类型::浮点32, "bwd.dEmbedAll");
-    vk张量 dTable = 建({V, D}, 张量类型::浮点32, "bwd.dTable");
 
     // ERSA 历史梯度
     vk张量 dQH = 建({H, T, DK}, 张量类型::浮点32, "bwd.dQH");
@@ -983,7 +1147,6 @@ int main(int argc, char** argv) {
     vk张量 dVH = 建({H, T, DV}, 张量类型::浮点32, "bwd.dVH");
     vk张量 dSinkH = 建({H}, 张量类型::浮点32, "bwd.dsink");
     vk张量 dqRawH = 建({H, T, DK}, 张量类型::浮点32, "bwd.dqRawH");
-    vk张量 dkRawH = 建({H, T, DK}, 张量类型::浮点32, "bwd.dkRawH");
     vk张量 dqRawAll = 建({T, HDK}, 张量类型::浮点32, "bwd.dqRawAll");
     vk张量 dkRawAll = 建({T, HDK}, 张量类型::浮点32, "bwd.dkRawAll");
     vk张量 dvAll = 建({T, HDV}, 张量类型::浮点32, "bwd.dvAll");
@@ -1025,8 +1188,6 @@ int main(int argc, char** argv) {
         vk张量& dBranchMidAll = dBranchMidAllV[buf];
         vk张量& dX2All = dX2AllV[buf];
         vk张量& dScoreAll = dScoreAllV[buf];
-        vk张量& dW2w = dW2wV[buf];
-        vk张量& db2w = db2wV[buf];
         vk张量& moePre = moePreV[buf];
         vk张量& moeHq = moeHqV[buf];
         vk张量& moeDh = moeDhV[buf];
@@ -1039,14 +1200,6 @@ int main(int argc, char** argv) {
         vk张量& moeDys = moeDysV[buf];
         vk张量& moeIdxS = moeIdxSV[buf];
         vk张量& moeKwS = moeKwSV[buf];
-        vk张量& dW1 = dW1V[buf];
-        vk张量& dW2 = dW2V[buf];
-        vk张量& dShW1T = dShW1TV[buf];
-        vk张量& dShWupT = dShWupTV[buf];
-        vk张量& dShW2T = dShW2TV[buf];
-        vk张量& dShW1 = dShW1V[buf];
-        vk张量& dShWup = dShWupV[buf];
-        vk张量& dShW2 = dShW2V[buf];
 
         // ── 阶段 A：一次序列并行 GR2 写回，连续写入 dYAll / dBranchMidAll ──
         const Gr2BwdPC g2{T, D, 最后 ? 1u : 0u, 0, 0};
@@ -1105,7 +1258,7 @@ int main(int argc, char** argv) {
             const float tau = 0.005f;
             const ASMSeqPC ap{B, H, M, R, DK, DV, T,
                               tau, tau, 0.9f, 0.01f, L.beta_null};
-            提交2("asm_step_bwd_seq_wg",
+            提交2(用Bf16旧状态 ? "asm_step_bwd_seq_wg_bf16" : "asm_step_bwd_seq_wg",
                   {asmQAll[li].取句柄(), asmKAll[li].取句柄(), asmVAll[li].取句柄(),
                    asmEtaAll[li].取句柄(), asmKOldAll[li].取句柄(),
                    asmVOldAll[li].取句柄(), asmBoldAll[li].取句柄(),
@@ -1129,7 +1282,7 @@ int main(int argc, char** argv) {
         // MoE 全部 dW 合并：routed + shared 一次 dispatch，直接写参数梯度。
         const MoeDwAllPC dwall{T, E, K, D, F};
         const std::uint32_t dwN = 2u * E * D * F + 3u * D * F;
-        提交2("moe_bwd_dw_all_i8",
+        提交2(L.W1 && L.W1->梯度bf16 ? "moe_bwd_dw_all_i8_bf16" : "moe_bwd_dw_all_i8",
               {moeXs.取句柄(), moeDys.取句柄(), moeIdxS.取句柄(),
                moeKwS.取句柄(), moePre.取句柄(), moeHq.取句柄(),
                moeDh.取句柄(), moeShPre.取句柄(), moeShUp.取句柄(),
@@ -1251,23 +1404,30 @@ int main(int argc, char** argv) {
             const vk张量& dyq = L.ersa ? dqT : dqRawAll;
             const vk张量& dyk = L.ersa ? dkT : dkRawAll;
             const vk张量& dyv = L.ersa ? dvT : dvAll;
-            const LinDwdb5PC dpc{T,
-                                 E, D,
-                                 D, HDV,
-                                 HDK, D,
-                                 HDK, D,
-                                 HDV, D, 0};
-            const std::uint32_t dwdbN =
-                E * D + D * HDV + 2u * HDK * D + HDV * D;
-            提交2("linear_bwd_dwdb5",
-                  {x2All[li].取句柄(), oDeqAll[li].取句柄(), xDeq.取句柄(),
-                   dScoreAll.取句柄(), dWoYAll.取句柄(),
-                   dyq.取句柄(), dyk.取句柄(), dyv.取句柄(),
-                   L.gate->g.取句柄(), L.Wo->g.取句柄(),
-                   L.Wq->g.取句柄(), L.Wk->g.取句柄(), L.Wv->g.取句柄(),
-                   dGateDb.取句柄(), dWoDb.取句柄(),
-                   dWqDb.取句柄(), dWkDb.取句柄(), dWvDb.取句柄()},
-                  &dpc, sizeof(dpc), (dwdbN + 63u) / 64u, 1, 1);
+            const std::uint32_t 组014 = E * D + D * HDV + 2u * HDK * D + HDV * D;
+            const std::vector<张量句柄> 绑{x2All[li].取句柄(), oDeqAll[li].取句柄(), xDeq.取句柄(),
+                                     dScoreAll.取句柄(), dWoYAll.取句柄(),
+                                     dyq.取句柄(), dyk.取句柄(), dyv.取句柄(),
+                                     L.gate->g.取句柄(), L.Wo->g.取句柄(),
+                                     L.Wq->g.取句柄(), L.Wk->g.取句柄(), L.Wv->g.取句柄(),
+                                     dGateDb.取句柄(), dWoDb.取句柄(),
+                                     dWqDb.取句柄(), dWkDb.取句柄(), dWvDb.取句柄()};
+            if (L.Wq->梯度bf16) {
+                // gate 未量化 ⇒ 其梯度仍 fp32：组 0 单独走 fp32 内核，组 1..4 走 bf16 内核。
+                const LinDwdb5PC gpc{T, E, D, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+                提交2("linear_bwd_dwdb5", 绑, &gpc, sizeof(gpc), (E * D + 63u) / 64u, 1, 1);
+                const LinDwdb5PC bpc{T, 0, 0, D, HDV, HDK, D, HDK, D, HDV, D, 0};
+                const std::uint32_t 组14 = D * HDV + 2u * HDK * D + HDV * D;
+                提交2("linear_bwd_dwdb5_bf16", 绑, &bpc, sizeof(bpc), (组14 + 63u) / 64u, 1, 1);
+            } else {
+                const LinDwdb5PC dpc{T,
+                                     E, D,
+                                     D, HDV,
+                                     HDK, D,
+                                     HDK, D,
+                                     HDV, D, 0};
+                提交2("linear_bwd_dwdb5", 绑, &dpc, sizeof(dpc), (组014 + 63u) / 64u, 1, 1);
+            }
         }
 
         if (L.ersa) {
@@ -1341,10 +1501,22 @@ int main(int argc, char** argv) {
 
         // layer0 的融合后处理已经写好 dEmbedAll。
         {
-            const 规格4 ep{T, V, D, 0};
-            提交2("embedding_bwd_scatter",
-                  {dEmbedAll.取句柄(), ids.取句柄(), embed->g.取句柄()},
-                  &ep, sizeof(ep), (T * D + 255u) / 256u, 1, 1);
+            if (embed->梯度bf16) {
+                填零(embedPartial);
+                const 规格4 sp{T, D, embedU, 0};
+                提交2("embedding_bwd_scatter_partial",
+                      {dEmbedAll.取句柄(), ids.取句柄(), embedTokenMap.取句柄(), embedPartial.取句柄()},
+                      &sp, sizeof(sp), (T * D + 255u) / 256u, 1, 1);
+                const 规格4 cp{embedU, D, V, 0};
+                提交2("embedding_bwd_partial_to_bf16",
+                      {embedUniqueIds.取句柄(), embedPartial.取句柄(), embed->g.取句柄()},
+                      &cp, sizeof(cp), (embedU * D + 255u) / 256u, 1, 1);
+            } else {
+                const 规格4 ep{T, V, D, 0};
+                提交2("embedding_bwd_scatter",
+                      {dEmbedAll.取句柄(), ids.取句柄(), embed->g.取句柄()},
+                      &ep, sizeof(ep), (T * D + 255u) / 256u, 1, 1);
+            }
         }
         冲刷批();
         if (!big3b) {
@@ -1359,14 +1531,17 @@ int main(int argc, char** argv) {
 
     auto 刷新前向量化 = [&]() {
         冲刷批();
+        if (用I8参数) return;   // INT8 直写：更新已写回 i8，不需要从 fp32 重量化
         for (auto& p : 全部参数) {
             if (!p->量化) continue;
+            if (p->miniI8) continue;   // INT8 直写：更新已写回 i8，无需重量化
             const QuantPC pc{p->rows, p->cols, p->G, 0};
             提交2("quantize_rows_i8",
                   {p->p.取句柄(), p->i8.取句柄(), p->s.取句柄()},
                   &pc, sizeof(pc), (p->rows * p->G + 127u) / 128u, 1, 1);
         }
         冲刷批();
+        if (big3b) return;   // 3B：W1/W2 的 CPU 重量化是 6.4GB 级下载，训练循环里跳过
         for (std::uint32_t li = 0; li < cfg.n_layers; ++li) {
             层& L = 层表[li];
             std::vector<float> w1(static_cast<std::size_t>(E) * D * F), w2(static_cast<std::size_t>(E) * F * D);
@@ -1388,8 +1563,140 @@ int main(int argc, char** argv) {
         }
     };
 
+    // Apollo 归约输出（3 float）：s1=d·Δm, s2=d²B, s3=Σd⁴
+    vk张量 apollo归约 = 建零(3, "apollo.red");
+
     auto 更新 = [&](std::uint32_t step) {
-        const float lr = 3e-4f, beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f, wd = 0.01f;
+        const float lr = adamw_lr, beta1 = 0.9f, beta2 = 0.999f, eps = 1e-8f, wd = 0.01f;
+        if (用Apollo优化器) {
+            // VK Apollo：每参数 apollo_reduce（单工作组归约）→ 回读 3 float → apollo_update
+            冲刷批();
+            const float beta = 0.9f;
+            const float bt = std::pow(beta, float(step));
+            const float bt1 = std::pow(beta, float(step) - 1.0f);
+            const float c1 = beta * (1.0f - bt1) / (1.0f - bt);
+            const float c2 = (1.0f - beta) / (1.0f - bt);
+            for (auto& p : 全部参数) {
+                const 规格Apollo归约 rpc{static_cast<std::uint32_t>(p->n), beta, c1, c2,
+                                        (step == 1u ? 1u : 0u), 0u, 0u, 0u};
+                const std::uint64_t rid = 调度器.提交自定义算子(
+                    "apollo_reduce",
+                    {p->g.取句柄(), p->m.取句柄(), p->d.取句柄(), p->b.取句柄(),
+                     apollo归约.取句柄()},
+                    &rpc, sizeof(rpc), 派发规格{1u, 1u, 1u});
+                调度器.等待(rid);
+                float 结果[3] = {0.0f, 0.0f, 0.0f};
+                apollo归约.下载(结果, sizeof(结果));
+                const float 范数4 = std::pow(std::max(结果[2], 0.0f), 0.25f);
+                const float alpha = (结果[0] + 结果[1]) / std::pow(范数4 + 1e-8f, 4.0f);
+                const 规格Apollo更新 upc{static_cast<std::uint32_t>(p->n), alpha,
+                                        apollo_lr, apollo_sigma, apollo_bmax,
+                                        0.0f, 0.0f, 0.0f};
+                const std::uint64_t uid = 调度器.提交自定义算子(
+                    "apollo_update",
+                    {p->p.取句柄(), p->b.取句柄(), p->m.取句柄(), p->d.取句柄()},
+                    &upc, sizeof(upc), 派发规格{(p->n + 255u) / 256u, 1u, 1u});
+                调度器.等待(uid);
+            }
+            刷新前向量化();
+            return;
+        }
+        if (用I8参数) {
+            // INT8 直写：量化参数走 apollo_mini_apply_i8（随机舍入），1D/W1W2 走 AdamW/Mini
+            冲刷批();
+            const bool dbgDirect = 用MoE直写 && std::getenv("ASM_DBG_MOE") != nullptr;
+            std::vector<std::int8_t> w1前, w2前;
+            if (dbgDirect) {
+                const std::size_t n = std::min<std::size_t>(65536, 层表[0].moe_W1_i8.布局().元素总数);
+                w1前.resize(n);
+                w2前.resize(std::min<std::size_t>(n, 层表[0].moe_W2_i8.布局().元素总数));
+                层表[0].moe_W1_i8.下载(w1前.data(), w1前.size());
+                层表[0].moe_W2_i8.下载(w2前.data(), w2前.size());
+            }
+            for (auto& p : 全部参数) {
+                if (p->miniI8) { p->miniI8->步骤(); continue; }
+                if (p->mini) { p->mini->步骤(); continue; }
+                if (p->量化) continue;   // 量化但没有 miniI8/mini（如 W1/W2）不更新
+                const float b1t = std::pow(beta1, float(step));
+                const float b2t = std::pow(beta2, float(step));
+                const 规格Adam pc{adamw_lr, beta1, beta2, eps,
+                                  1.0f / (1.0f - b1t), 1.0f / (1.0f - b2t),
+                                  static_cast<std::uint32_t>(p->n), 0.0f, 1u};
+                提交2(p->梯度bf16 ? "adamw_update_bf16" : "adamw_update",
+                      {p->g.取句柄(), p->p.取句柄(), p->m.取句柄(), p->v.取句柄()},
+                      &pc, sizeof(pc), (p->n + 63u) / 64u, 1, 1);
+            }
+            冲刷批();
+            // W1/W2 的 fp32 master → 前向 i8 副本（重量化 + 布局转置，一个内核）
+            if (!用MoE直写 && E > 0 && F > 0 && D > 0) {
+                struct MQWPC { std::uint32_t E, F, D, mode, G, base; };
+                static_assert(sizeof(MQWPC) == 24, "moe_quant_w push");
+                const std::uint32_t G1 = (D + 127u) / 128u;
+                const std::uint32_t G2 = (F + 127u) / 128u;
+                const std::uint32_t 组块 = 32768u;
+                auto 派发MQW = [&](const vk张量& P, vk张量& Q, vk张量& S, std::uint32_t mode,
+                                   std::uint32_t G, std::uint32_t 总数) {
+                    for (std::uint32_t base = 0; base < 总数; base += 组块) {
+                        const std::uint32_t n = std::min(组块, 总数 - base);
+                        const MQWPC pc{E, F, D, mode, G, base};
+                        提交2("moe_quant_w", {P.取句柄(), Q.取句柄(), S.取句柄()},
+                              &pc, sizeof(pc), n, 1, 1);
+                    }
+                };
+                for (auto& L : 层表) {
+                    if (!L.W1 || !L.W2) continue;
+                    派发MQW(L.W1->p, L.moe_W1_i8, L.moe_W1_s, 0u, G1, E * F * G1);
+                    派发MQW(L.W2->p, L.moe_W2_i8, L.moe_W2_s, 1u, G2, E * D * G2);
+                }
+                冲刷批();
+                if (const char* dbg = std::getenv("ASM_DBG_MOE"); dbg && *dbg) {
+                    std::vector<std::int8_t> h(4096);
+                    层表[0].moe_W1_i8.下载(h.data(), h.size());
+                    long long sum = 0;
+                    for (auto v : h) sum += v;
+                    std::printf("  [moe] L0.moe_W1_i8 前4096和=%lld\n", sum);
+                }
+            }
+            if (dbgDirect) {
+                auto 报变化 = [&](const char* 名, const std::vector<std::int8_t>& 前, vk张量& 权重) {
+                    std::vector<std::int8_t> 后(前.size());
+                    权重.下载(后.data(), 后.size());
+                    std::size_t 变化 = 0;
+                    double 均差 = 0.0;
+                    for (std::size_t i = 0; i < 前.size(); ++i) {
+                        变化 += 前[i] != 后[i];
+                        均差 += std::abs(int(后[i]) - int(前[i]));
+                    }
+                    均差 /= double(前.size());
+                    std::printf("  [moe-direct] %s sample=%zu 变化=%zu mean|Δq|=%.6g\n",
+                                名, 前.size(), 变化, 均差);
+                };
+                报变化("W1(L0)", w1前, 层表[0].moe_W1_i8);
+                报变化("W2(L0)", w2前, 层表[0].moe_W2_i8);
+            }
+            刷新前向量化();
+            return;
+        }
+        if (用ApolloMini) {
+            // APOLLO-Mini：2D+ 参数走低秩辅助缩放，1D 参数回退 AdamW
+            冲刷批();
+            for (auto& p : 全部参数) {
+                if (p->mini) { p->mini->步骤(); continue; }
+                if (p->名.find(".W1") != std::string::npos ||
+                    p->名.find(".W2") != std::string::npos) continue;   // big3b 已释放 p
+                const float b1t = std::pow(beta1, float(step));
+                const float b2t = std::pow(beta2, float(step));
+                const 规格Adam pc{adamw_lr, beta1, beta2, eps,
+                                  1.0f / (1.0f - b1t), 1.0f / (1.0f - b2t),
+                                  static_cast<std::uint32_t>(p->n), 0.0f, 1u};
+                提交2(p->梯度bf16 ? "adamw_update_bf16" : "adamw_update",
+                      {p->g.取句柄(), p->p.取句柄(), p->m.取句柄(), p->v.取句柄()},
+                      &pc, sizeof(pc), (p->n + 63u) / 64u, 1, 1);
+            }
+            冲刷批();
+            刷新前向量化();
+            return;
+        }
         const float b1t = std::pow(beta1, float(step));
         const float b2t = std::pow(beta2, float(step));
         for (auto& p : 全部参数) {
@@ -1548,7 +1855,7 @@ int main(int argc, char** argv) {
                     const AsmStepPC pc{B, H, M, DK, DV, R, t, T,
                                        tau, tau, 0.9f, 0.01f, L.beta_null,
                                        ASM新颖阈值, 0.0f};
-                    提交2("asm_step_eta",
+                    提交2(用Bf16旧状态 ? "asm_step_eta_bf16" : "asm_step_eta",
                           {qkv_q.取句柄(), qkv_k.取句柄(), qkv_v.取句柄(),
                            L.K.取句柄(), L.V.取句柄(), L.beta.取句柄(), L.gamma->p.取句柄(),
                            o.取句柄(), eta.取句柄(), dbg.取句柄(),
@@ -1634,6 +1941,9 @@ int main(int argc, char** argv) {
             if (big3b) {
                 std::printf("3B cache: layers=%u D=%u H=%u Ttot=%u | 参数构建完成\n",
                             cfg.n_layers, D, H, T);
+                std::printf("3B MoE 参数: %s\n", 用MoE直写 ? "W1/W2 i8 direct" : "fp32 master + requant");
+                std::printf("3B ASM 旧状态: %s\n", 用Bf16旧状态 ? "bf16 K/V snapshots" : "fp32 K/V snapshots");
+                std::printf("3B 词表梯度: %s\n", 用Bf16词表梯度 ? "bf16 (embed fp32 partial)" : "fp32");
                 // 先测串提交（训练主路径），再开采样跑一遍出热点表。
                 fwd_cache = true;
                 const auto cf0 = std::chrono::steady_clock::now();
@@ -1679,6 +1989,23 @@ int main(int argc, char** argv) {
                 size_t grad_elems = 0;
                 for (auto& p : 全部参数) grad_elems += p->n;
                 const auto live = vk底层::缓冲::存活字节计().load();
+                if (std::getenv("ASM_MEMREPORT") != nullptr) {
+                    std::map<std::string, double> 账;
+                    auto 记 = [&](const char* k, std::uint64_t b) {
+                        账[k] += double(b) / (1024.0 * 1024.0 * 1024.0);
+                    };
+                    for (auto& q : 全部参数) {
+                        记("p(权重)", q->p.字节大小());
+                        记("g(梯度)", q->g.字节大小());
+                        记("m", q->m.字节大小());
+                        记("v", q->v.字节大小());
+                        记("i8", q->i8.字节大小());
+                        记("s", q->s.字节大小());
+                    }
+                    for (const auto& kv : 账)
+                        std::printf("  [mem] %-10s %.2f GiB\n", kv.first.c_str(), kv.second);
+                    std::printf("  [mem] %-10s %.2f GiB\n", "合计", double(live) / (1024.0 * 1024.0 * 1024.0));
+                }
                 std::printf("3B cache 实测: fwd %.2f ms | bwd %.2f ms | loss %.6f | "
                             "params %zu | grad_elems %zu | nonfinite_logits %zu | "
                             "VK live %.2f GiB\n",
@@ -1734,6 +2061,42 @@ int main(int argc, char** argv) {
                             "moe.dh %.6g | moe.shpre %.6g\n",
                             范数(dOutTokens), 范数(dYAllV[0]), 范数(moeXsV[0]),
                             范数(moeDhV[0]), 范数(moeShPreV[0]));
+                size_t bf16_params = 0, bf16_elems = 0, bf16_nonfinite = 0;
+                double bf16_norm_sq = 0.0;
+                if (const char* dbg = std::getenv("ASM_DBG_BF16"); dbg && *dbg) {
+                    auto 转储 = [&](const char* tag, auto& p) {
+                        if (!p->梯度bf16) { std::printf("  [dbg] %s 非 bf16\n", tag); return; }
+                        std::vector<std::uint16_t> h(static_cast<std::size_t>(p->n));
+                        p->g.下载(h.data(), h.size() * 2);
+                        int nn = 0;
+                        for (auto v : h)
+                            if (((v >> 7) & 0xFFu) == 0xFFu && (v & 0x7Fu)) ++nn;
+                        std::printf("  [dbg] %s n=%u nan=%d 前8:", tag, p->n, nn);
+                        for (std::size_t i = 0; i < 8 && i < h.size(); ++i) std::printf(" %04x", h[i]);
+                        std::printf("\n");
+                    };
+                    转储("Wq(L0)", 层表[0].Wq);
+                    转储("W1(L0)", 层表[0].W1);
+                    转储("shW1(L0)", 层表[0].shW1);
+                    转储("gate(L0)", 层表[0].gate);
+                    for (auto& p : 全部参数) {
+                        if (!p->梯度bf16) continue;
+                        ++bf16_params;
+                        bf16_elems += p->n;
+                        std::vector<std::uint16_t> h(static_cast<std::size_t>(p->n));
+                        p->g.下载(h.data(), h.size() * 2);
+                        for (auto v : h) {
+                            const std::uint32_t u = std::uint32_t(v) << 16;
+                            float x = 0.0f;
+                            std::memcpy(&x, &u, sizeof(x));
+                            if (!std::isfinite(x)) ++bf16_nonfinite;
+                            else bf16_norm_sq += double(x) * double(x);
+                        }
+                    }
+                    std::printf("  bf16 gradients: params %zu | elems %zu | nonfinite %zu | global norm %.6g\n",
+                                bf16_params, bf16_elems, bf16_nonfinite,
+                                std::sqrt(bf16_norm_sq));
+                }
                 float nWq16 = 范数(层表[cfg.n_layers/2].Wq->g);
                 float nSh16 = 范数(层表[cfg.n_layers/2].shW1->g);
                 std::printf("  grad norms: finalNorm %.6g | Wq(L16) %.6g | Wq(L0) %.6g | "
@@ -1741,7 +2104,45 @@ int main(int argc, char** argv) {
                             范数(finalNorm->g), nWq16,
                             范数(层表[0].Wq->g), nSh16,
                             范数(层表[0].shW1->g), 范数(层表[0].gate->g));
-                const bool ok = (bad == 0 && nWq16 > 1e-12f && nSh16 > 1e-12f);
+                const bool ok = (bad == 0 && bf16_nonfinite == 0 &&
+                                 nWq16 > 1e-12f && nSh16 > 1e-12f);
+                if (训练循环) {
+                    const char* st = std::getenv("ASM_STEPS");
+                    const int 训练步数 = st ? std::atoi(st) : 10;
+                    for (int s = 0; s < 训练步数; ++s) {
+                        std::printf("[3b_train] s=%d fwd\n", s + 1);
+                        前向();
+                        std::printf("[3b_train] s=%d bwd\n", s + 1);
+                        清零梯度();
+                        bwd_cache = true;
+                        const float l = 反向全部();
+                        std::printf("[3b_train] s=%d upd\n", s + 1);
+                        更新(1);
+                        std::printf("3b_train step %d loss=%.6f\n", s + 1, l);
+                    }
+                    调度器.停止();
+                    return 0;
+                }
+                if (用I8参数 && ok) {
+                    // INT8 直写更新一步：量化矩阵只有 i8，更新后不重量化
+                    清零梯度();
+                    bwd_cache = true;
+                    const float 更新loss = 反向全部();
+                    std::vector<std::int8_t> q前(层表[0].Wq->n);
+                    层表[0].Wq->i8.下载(q前.data(), q前.size());
+                    更新(1);
+                    std::vector<std::int8_t> q后(层表[0].Wq->n);
+                    层表[0].Wq->i8.下载(q后.data(), q后.size());
+                    std::size_t 变化 = 0;
+                    double 均差 = 0.0;
+                    for (std::size_t i = 0; i < q前.size(); ++i) {
+                        if (q前[i] != q后[i]) ++变化;
+                        均差 += std::abs(int(q后[i]) - int(q前[i]));
+                    }
+                    均差 /= double(q前.size());
+                    std::printf("i8 更新一步: loss=%.6f | 参数 %zu | Wq(L0) 变化 %zu/%zu mean|Δq|=%.4f\n",
+                                更新loss, 全部参数.size(), 变化, q前.size(), 均差);
+                }
                 std::printf("%s\n", ok ? "3B CACHE PASS" : "3B CACHE FAIL");
                 调度器.停止();
                 return ok ? 0 : 1;
@@ -1750,7 +2151,16 @@ int main(int argc, char** argv) {
                 std::vector<float> out;
                 for (auto& p : 全部参数) {
                     std::vector<float> g(static_cast<std::size_t>(p->n));
-                    p->g.下载(g.data(), g.size() * 4);
+                    if (p->梯度bf16) {
+                        std::vector<std::uint16_t> h(static_cast<std::size_t>(p->n));
+                        p->g.下载(h.data(), h.size() * 2);
+                        for (std::size_t i = 0; i < h.size(); ++i) {
+                            const std::uint32_t u = std::uint32_t(h[i]) << 16;
+                            std::memcpy(&g[i], &u, 4);
+                        }
+                    } else {
+                        p->g.下载(g.data(), g.size() * 4);
+                    }
                     out.insert(out.end(), g.begin(), g.end());
                 }
                 return out;
@@ -1836,6 +2246,14 @@ int main(int argc, char** argv) {
             const bool ok = (非有限 == 0 && 非有限梯度 == 0 && fdiff <= 1e-6f &&
                              gdiff <= 5e-4 && model_diff <= 1e-5f && (!parity_mode ||
                              (pfdiff <= 1e-6f && pgdiff <= 1e-3)));
+            if (用I8参数 && ok) {
+                // INT8 直写更新一步：参数只保留 i8，更新后不重量化
+                清零梯度();
+                bwd_cache = true;
+                const float loss2 = 反向全部();
+                更新(1);
+                std::printf("i8 更新一步: loss=%.6f | 参数 %zu\n", loss2, 全部参数.size());
+            }
             std::printf("%s\n", ok ? "CACHE PASS" : "CACHE FAIL");
             调度器.停止();
             return ok ? 0 : 1;
@@ -1878,7 +2296,16 @@ int main(int argc, char** argv) {
                 std::vector<float> out;
                 for (auto& p : 全部参数) {
                     std::vector<float> g(static_cast<std::size_t>(p->n));
-                    p->g.下载(g.data(), g.size() * 4);
+                    if (p->梯度bf16) {
+                        std::vector<std::uint16_t> h(static_cast<std::size_t>(p->n));
+                        p->g.下载(h.data(), h.size() * 2);
+                        for (std::size_t i = 0; i < h.size(); ++i) {
+                            const std::uint32_t u = std::uint32_t(h[i]) << 16;
+                            std::memcpy(&g[i], &u, 4);
+                        }
+                    } else {
+                        p->g.下载(g.data(), g.size() * 4);
+                    }
                     out.insert(out.end(), g.begin(), g.end());
                 }
                 return out;
