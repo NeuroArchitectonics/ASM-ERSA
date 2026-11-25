@@ -30,7 +30,7 @@ g++ -std=c++20 -O2 -pthread -o cpp/build/train_main_linux \
     cpp/train_main.cpp cpp/asm_ersa_model.cpp cpp/cpu_reference.cpp \
     优化器/ApolloMini.cpp 优化器/ApolloMiniI8.cpp \
     -I. -Icpp -Icpp/spv -Ispv -I优化器 \
-    -IASM-ERSA-Design/vk -IASM-ERSA-Design/vk/spv \
+    -Ivk \
     -lvulkan
 
 echo "[build] OK -> cpp/build/train_main_linux"

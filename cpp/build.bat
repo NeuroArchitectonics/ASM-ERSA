@@ -24,7 +24,7 @@ if errorlevel 1 ( echo [build] vcvars64 failed & exit /b 1 )
 if not exist "%ROOT%spv" mkdir "%ROOT%spv"
 if not exist "%ROOT%build" mkdir "%ROOT%build"
 
-set "CXXFLAGS=/nologo /EHsc /std:c++17 /utf-8 /O2 /W3 /MD /D_CRT_SECURE_NO_WARNINGS /I"%ROOT%." /I"%PRJ%" /I"%PRJ%\ASM-ERSA-Design\vk" /I"%VKSDK%\Include""
+set "CXXFLAGS=/nologo /EHsc /std:c++17 /utf-8 /O2 /W3 /MD /D_CRT_SECURE_NO_WARNINGS /I"%ROOT%." /I"%PRJ%" /I"%PRJ%\vk" /I"%VKSDK%\Include""
 set "LDFLAGS=/nologo /LIBPATH:"%VKSDK%\Lib" vulkan-1.lib"
 
 set "SHADER_TOOL=%PRJ%\ASM-ERSA-Design\vk\build\shader_tool.exe"
