@@ -27,7 +27,7 @@ public:
 
     // 参数/梯度是同一形状 [rows, cols] 的 fp32 张量（非拥有）
     ApolloMini(vk张量& 参数, vk张量& 梯度, std::uint32_t rows, std::uint32_t cols,
-               配置 配置 = {}, std::uint32_t seed = 1234u, bool 梯度bf16 = false);
+               配置 配置, std::uint32_t seed = 1234u, bool 梯度bf16 = false);
 
     void 步骤();
     void 重置();

@@ -4,6 +4,9 @@
 #include "asm_ersa_model.hpp"
 #include "vk张量.hpp"
 #include "流水线调度器.hpp"
+#ifdef ASM_TRAINER_LIBRARY
+#include "trainer_bridge.hpp"
+#endif
 
 // ── 前向融合 kernel ──
 #include "cpp/spv/asm_reset.spv.hpp"
@@ -310,6 +313,16 @@ struct 层 {
 
 } // namespace
 
+#ifdef ASM_TRAINER_LIBRARY
+int trainer_worker_main(const AsmTrainerConfig& 库配置, const std::string& spv_dir, TrainerBridge& bridge) {
+    const std::string spv目录 = spv_dir;
+    const std::string 模式 = "3b_train";
+    const bool smoke = false;
+    const bool big6b = false;
+    const bool big3b = true;
+    const bool 训练循环 = true;
+    const int 步数 = 0;
+#else
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::fprintf(stderr, "用法: %s <spv目录> [steps]\n", argv[0]);
@@ -324,7 +337,25 @@ int main(int argc, char** argv) {
     // 训练循环（每步 fwd/bwd/upd）：3b_train / 6b_train 共用
     const bool 训练循环 = (模式 == "3b_train" || 模式 == "6b_train");
     const int 步数 = smoke ? 0 : ((argc >= 3) ? std::atoi(argv[2]) : 4);
+#endif
 
+#ifdef ASM_TRAINER_LIBRARY
+    const bool 用Apollo优化器 = false;
+    const bool 用ApolloMini = true;
+    const bool 用I8参数 = 库配置.param_mode == 0;
+    const bool 保留MoEMaster = 库配置.keep_moe_master != 0;
+    const bool 用MoE直写 = big3b && 用I8参数 && !保留MoEMaster;
+    const bool 用Bf16旧状态 = big3b && 库配置.old_state_f32 == 0;
+    const bool 用Bf16梯度 = 库配置.grad_mode == 0;
+    const bool 用Bf16词表梯度 = big3b && 用Bf16梯度 && 库配置.word_grad_f32 == 0;
+    const float apollo_lr = 库配置.learning_rate;
+    const float apollo_sigma = 1e-4f;
+    const float apollo_bmax = 3.402823466e38f;
+    const float adamw_lr = 库配置.learning_rate;
+    const float mini_scale = 库配置.mini_scale;
+    const bool 调试Bf16 = (库配置.debug_flags & ASM_TRAINER_DEBUG_BF16) != 0;
+    const bool 调试MoE = (库配置.debug_flags & ASM_TRAINER_DEBUG_MOE) != 0;
+#else
     // 优化器选择：ASM_OPT=apollo 走 VK Apollo（m/B/d 常驻），否则 AdamW。
     const char* opt_env = std::getenv("ASM_OPT");
     const bool 用Apollo优化器 = (opt_env != nullptr && std::string(opt_env) == "apollo");
@@ -353,6 +384,9 @@ int main(int argc, char** argv) {
     const float adamw_lr = ad_lr_env ? static_cast<float>(std::atof(ad_lr_env)) : 3e-4f;
     const char* mini_scale_env = std::getenv("ASM_APOLLO_MINI_SCALE");
     const float mini_scale = mini_scale_env ? static_cast<float>(std::atof(mini_scale_env)) : 128.0f;
+    const bool 调试Bf16 = std::getenv("ASM_DBG_BF16") != nullptr;
+    const bool 调试MoE = std::getenv("ASM_DBG_MOE") != nullptr;
+#endif
 
     asm_ersa_model::ModelConfig cfg;
     cfg.d_model = 32;
@@ -455,8 +489,12 @@ int main(int argc, char** argv) {
         }
     }
 
+#ifdef ASM_TRAINER_LIBRARY
+    const std::uint32_t 模型seed = 库配置.seed;
+#else
     const char* seed_env = std::getenv("ASM_SEED");
     const std::uint32_t 模型seed = seed_env ? static_cast<std::uint32_t>(std::atoi(seed_env)) : 20261118u;
+#endif
     asm_ersa_model::ModelWeights 主 = asm_ersa_model::make_random_weights(cfg, 模型seed);
 
     std::vector<std::unique_ptr<参数>> 全部参数;
@@ -482,9 +520,14 @@ int main(int argc, char** argv) {
                                名.find(".Wk") != std::string::npos || 名.find(".Wv") != std::string::npos;
         const bool 是MoE权 = 名.find(".W1") != std::string::npos || 名.find(".W2") != std::string::npos ||
                             名.find(".shW") != std::string::npos;
+#ifdef ASM_TRAINER_LIBRARY
+        const std::string 范围 = 库配置.bf16_scope == 1 ? "linear" :
+                                 库配置.bf16_scope == 2 ? "moe" : "all";
+#else
         // ASM_BF16_SCOPE=linear|moe|all（默认 all），用于隔离 bf16 各段
         const char* 范围env = std::getenv("ASM_BF16_SCOPE");
         const std::string 范围 = 范围env ? 范围env : "all";
+#endif
         const bool 允许线性 = (范围 == "all" || 范围 == "linear");
         const bool 允许MoE = (范围 == "all" || 范围 == "moe");
         q->梯度bf16 = 用Bf16梯度 &&
@@ -529,7 +572,7 @@ int main(int argc, char** argv) {
                 mc.scale = mini_scale;
                 q->miniI8 = std::make_unique<ApolloMiniI8>(q->i8, q->s, q->g, rows, cols, mc,
                                                            20261124u + 模型seed + static_cast<std::uint32_t>(q->n),
-                                                           q->G, q->梯度bf16);
+                                                           q->G, q->梯度bf16, ApolloMiniI8::MoE直写布局{});
             }
         }
         if (q->mini || q->miniI8) {
@@ -1604,7 +1647,7 @@ int main(int argc, char** argv) {
         if (用I8参数) {
             // INT8 直写：量化参数走 apollo_mini_apply_i8（随机舍入），1D/W1W2 走 AdamW/Mini
             冲刷批();
-            const bool dbgDirect = 用MoE直写 && std::getenv("ASM_DBG_MOE") != nullptr;
+            const bool dbgDirect = 用MoE直写 && 调试MoE;
             std::vector<std::int8_t> w1前, w2前;
             if (dbgDirect) {
                 const std::size_t n = std::min<std::size_t>(65536, 层表[0].moe_W1_i8.布局().元素总数);
@@ -1649,7 +1692,7 @@ int main(int argc, char** argv) {
                     派发MQW(L.W2->p, L.moe_W2_i8, L.moe_W2_s, 1u, G2, E * D * G2);
                 }
                 冲刷批();
-                if (const char* dbg = std::getenv("ASM_DBG_MOE"); dbg && *dbg) {
+                if (调试MoE) {
                     std::vector<std::int8_t> h(4096);
                     层表[0].moe_W1_i8.下载(h.data(), h.size());
                     long long sum = 0;
@@ -1935,6 +1978,63 @@ int main(int argc, char** argv) {
         冲刷批();
     };
 
+#ifdef ASM_TRAINER_LIBRARY
+    bridge.mark_ready();
+    std::uint64_t step = 0;
+    for (;;) {
+        const TrainerBridge::Command command = bridge.wait_command();
+        if (command == TrainerBridge::Command::Stop) break;
+        if (command == TrainerBridge::Command::None) continue;
+
+        ++step;
+        const auto f0 = std::chrono::steady_clock::now();
+        前向();
+        const auto f1 = std::chrono::steady_clock::now();
+        清零梯度();
+        bwd_cache = true;
+        const auto b0 = std::chrono::steady_clock::now();
+        const float loss = 反向全部();
+        const auto b1 = std::chrono::steady_clock::now();
+        const auto u0 = std::chrono::steady_clock::now();
+        更新(static_cast<std::uint32_t>(step));
+        冲刷批();
+        const auto u1 = std::chrono::steady_clock::now();
+        if (!std::isfinite(loss)) throw std::runtime_error("loss 非有限");
+
+        AsmTrainerStats stats{};
+        stats.struct_size = static_cast<std::uint32_t>(sizeof(AsmTrainerStats));
+        stats.step = step;
+        stats.loss = loss;
+        stats.forward_ms = std::chrono::duration<double, std::milli>(f1 - f0).count();
+        stats.backward_ms = std::chrono::duration<double, std::milli>(b1 - b0).count();
+        stats.update_ms = std::chrono::duration<double, std::milli>(u1 - u0).count();
+        stats.vk_live_bytes = vk底层::缓冲::存活字节计().load();
+        if (调试Bf16) {
+            double norm_sq = 0.0;
+            for (auto& p : 全部参数) {
+                if (!p->梯度bf16) continue;
+                ++stats.bf16_params;
+                stats.bf16_elems += p->n;
+                std::vector<std::uint16_t> h(static_cast<std::size_t>(p->n));
+                p->g.下载(h.data(), h.size() * 2);
+                for (auto v : h) {
+                    const std::uint32_t u = std::uint32_t(v) << 16;
+                    float x = 0.0f;
+                    std::memcpy(&x, &u, sizeof(x));
+                    if (!std::isfinite(x)) ++stats.bf16_nonfinite;
+                    else norm_sq += double(x) * double(x);
+                }
+            }
+            stats.bf16_global_norm = std::sqrt(norm_sq);
+            if (stats.bf16_nonfinite != 0)
+                throw std::runtime_error("bf16 梯度包含非有限值");
+        }
+        bridge.publish(stats);
+    }
+    调度器.停止();
+    return 0;
+}
+#else
     // 与主模型 INT8 前向做一次回归：训练器用自己的参数/缓冲，数值应一致。
     if (cache_mode) {
         try {
@@ -2390,3 +2490,4 @@ int main(int argc, char** argv) {
     调度器.停止();
     return 0;
 }
+#endif

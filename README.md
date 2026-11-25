@@ -179,6 +179,20 @@ torchrun --nproc_per_node=8 train_omni_3b.py \
     --output-dir /checkpoints/asm_ersa-omni-3b
 ```
 
+### Linux x86_64 共享库（云服务器免编译）
+
+`dist/asm-ersa-trainer-linux-x86_64.tar.gz` 包含 `libasm_ersa_trainer.so`、运行时 SPIR-V、C 头和 Python `ctypes` 绑定，不包含 `.comp` 源码。
+
+```bash
+mkdir -p asm-trainer
+tar -xzf asm-ersa-trainer-linux-x86_64.tar.gz -C asm-trainer
+cd asm-trainer
+python3 example_train.py --steps 4 --seed 7 --debug-bf16
+```
+
+C ABI：`asm_trainer_create` → `asm_trainer_train_step` / `asm_trainer_get_stats` → `asm_trainer_destroy`。
+云主机仍需可用的 Vulkan GPU 驱动；同一进程只能创建一个 trainer。
+
 ## 🏗️ Architecture
 
 ASM-ERSA consists of 48 layers with a 3:1 hybrid structure:

@@ -29,8 +29,8 @@ public:
 
     ApolloMiniI8(vk张量& 权重i8, vk张量& 行尺度, vk张量& 梯度,
                  std::uint32_t rows, std::uint32_t cols, 配置 配置, std::uint32_t seed,
-                 std::uint32_t G = 1, bool 梯度bf16 = false,
-                 MoE直写布局 moe布局 = {});
+                 std::uint32_t G, bool 梯度bf16,
+                 MoE直写布局 moe布局);
 
     void 步骤();
     void 重置();
