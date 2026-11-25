@@ -190,8 +190,8 @@ cd asm-trainer
 python3 example_train.py --steps 4 --seed 7 --debug-bf16
 ```
 
-C ABI：`asm_trainer_create` → `asm_trainer_train_step` / `asm_trainer_get_stats` / `asm_trainer_save_checkpoint` → `asm_trainer_destroy`。
-`asm_trainer_save_checkpoint(path)` 写出 ASM8BIN 权重（推理侧可直接加载）和 `<path>.opt` 优化器状态（APOLLO-Mini 低秩状态 + AdamW 矩 + 步数）。
+C ABI：`asm_trainer_create` → `asm_trainer_train_step` / `asm_trainer_get_stats` / `asm_trainer_save_checkpoint` / `asm_trainer_load_checkpoint` → `asm_trainer_destroy`。
+`asm_trainer_save_checkpoint(path)` 写出 ASM8BIN 权重（推理侧可直接加载）和 `<path>.opt` 优化器状态（APOLLO-Mini 低秩状态 + AdamW 矩 + 步数）；`asm_trainer_load_checkpoint(path)` 恢复权重、优化器状态与步数后续训。
 云主机仍需可用的 Vulkan GPU 驱动；同一进程只能创建一个 trainer。
 
 ## 🏗️ Architecture

@@ -18,7 +18,7 @@ extern "C" {
 #define ASM_TRAINER_API __attribute__((visibility("default")))
 #endif
 
-#define ASM_TRAINER_VERSION "1.1.0"
+#define ASM_TRAINER_VERSION "1.2.0"
 #define ASM_TRAINER_DEBUG_BF16 1u
 #define ASM_TRAINER_DEBUG_MOE  2u
 
@@ -70,6 +70,11 @@ ASM_TRAINER_API int asm_trainer_get_stats(AsmTrainerHandle* handle,
                                           size_t error_buffer_size);
 /* 保存检查点：path 写 ASM8BIN 权重，path.opt 写 Apollo/AdamW 优化器状态 */
 ASM_TRAINER_API int asm_trainer_save_checkpoint(AsmTrainerHandle* handle,
+                                                const char* path,
+                                                char* error_buffer,
+                                                size_t error_buffer_size);
+/* 加载检查点：恢复权重、优化器状态与步数，用于续训 */
+ASM_TRAINER_API int asm_trainer_load_checkpoint(AsmTrainerHandle* handle,
                                                 const char* path,
                                                 char* error_buffer,
                                                 size_t error_buffer_size);

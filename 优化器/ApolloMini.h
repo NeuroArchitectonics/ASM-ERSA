@@ -8,6 +8,7 @@
 // 优化器状态约 2·cols + rows 个 float，与参数量相比可忽略（SGD 级）。
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 #include "vk张量.hpp"
@@ -47,6 +48,17 @@ public:
         if (!P.empty()) P_.下载(P.data(), P.size() * sizeof(float));
         if (!M.empty()) M_.下载(M.data(), M.size() * sizeof(float));
         if (!V.empty()) V_.下载(V.data(), V.size() * sizeof(float));
+    }
+    void 导入状态(const std::vector<float>& P, const std::vector<float>& M,
+                 const std::vector<float>& V, std::uint32_t 步数, float 上一缩放范数) {
+        if (P.size() != inner_ || M.size() != R_len_ || V.size() != R_len_)
+            throw std::runtime_error("APOLLO-Mini 状态尺寸不匹配");
+        if (!P.empty()) P_.上传(P.data(), P.size() * sizeof(float));
+        if (!M.empty()) M_.上传(M.data(), M.size() * sizeof(float));
+        if (!V.empty()) V_.上传(V.data(), V.size() * sizeof(float));
+        Phost_ = P;
+        步数_ = 步数;
+        上一缩放范数_ = 上一缩放范数;
     }
 
 private:

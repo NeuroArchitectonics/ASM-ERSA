@@ -90,6 +90,13 @@ def _load_library(path: Path):
         ctypes.c_size_t,
     ]
     lib.asm_trainer_save_checkpoint.restype = ctypes.c_int
+    lib.asm_trainer_load_checkpoint.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.c_size_t,
+    ]
+    lib.asm_trainer_load_checkpoint.restype = ctypes.c_int
     lib.asm_trainer_destroy.argtypes = [ctypes.c_void_p]
     lib.asm_trainer_destroy.restype = None
     lib.asm_trainer_version.argtypes = []
@@ -192,6 +199,20 @@ class Trainer:
         if rc != 0:
             message = self._error.value.decode("utf-8", errors="replace")
             raise TrainerError(message or f"save_checkpoint 失败，rc={rc}")
+
+    def load_checkpoint(self, path: str | Path) -> None:
+        if self._handle is None:
+            raise TrainerError("trainer 已关闭")
+        resolved = Path(path).expanduser().resolve()
+        rc = self._lib.asm_trainer_load_checkpoint(
+            self._handle,
+            str(resolved).encode("utf-8"),
+            self._error,
+            ctypes.sizeof(self._error),
+        )
+        if rc != 0:
+            message = self._error.value.decode("utf-8", errors="replace")
+            raise TrainerError(message or f"load_checkpoint 失败，rc={rc}")
 
     def close(self) -> None:
         if self._handle is not None:

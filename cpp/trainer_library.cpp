@@ -162,6 +162,28 @@ ASM_TRAINER_API int asm_trainer_save_checkpoint(AsmTrainerHandle* handle,
     return 0;
 }
 
+ASM_TRAINER_API int asm_trainer_load_checkpoint(AsmTrainerHandle* handle,
+                                                const char* path,
+                                                char* error_buffer,
+                                                size_t error_buffer_size) {
+    if (handle == nullptr || path == nullptr || *path == '\0') {
+        set_error(error_buffer, error_buffer_size, "handle/path 不能为空");
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(handle->api_mutex);
+    if (handle->bridge.failed()) {
+        set_error(error_buffer, error_buffer_size, handle->bridge.error());
+        return -1;
+    }
+    handle->bridge.request_load(path);
+    handle->bridge.wait_result();
+    if (handle->bridge.failed()) {
+        set_error(error_buffer, error_buffer_size, handle->bridge.error());
+        return -1;
+    }
+    return 0;
+}
+
 ASM_TRAINER_API void asm_trainer_destroy(AsmTrainerHandle* handle) {
     if (handle == nullptr) return;
     shutdown_handle(handle);

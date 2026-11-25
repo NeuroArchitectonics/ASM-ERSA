@@ -1008,6 +1008,202 @@ int main(int argc, char** argv) {
                     static_cast<unsigned long long>(已训步数), 记录数);
     };
 
+    // 从检查点恢复权重 + 优化器状态（续训）
+    auto 加载权重 = [&](const std::string& 路径) {
+        std::ifstream rf(路径, std::ios::binary);
+        if (!rf) throw std::runtime_error("无法打开检查点: " + 路径);
+        struct BinHeader {
+            char magic[8];
+            std::uint32_t version;
+            std::uint32_t D, H, DK, DV, F, L, V_, E_, M_, TOPR, GROUP, BLOCK, TOPB, WINDOW, TOPK, TMAX;
+        };
+        BinHeader h{};
+        rf.read(reinterpret_cast<char*>(&h), sizeof(h));
+        if (!rf || std::memcmp(h.magic, "ASM8BIN", 7) != 0)
+            throw std::runtime_error("不是 ASM8BIN 检查点: " + 路径);
+        if (h.version != 1) throw std::runtime_error("ASM8BIN 版本不支持");
+        if (h.D != D || h.H != H || h.DK != DK || h.DV != DV || h.F != F ||
+            h.L != cfg.n_layers || h.V_ != V || h.E_ != E || h.M_ != M ||
+            h.TOPR != R || h.BLOCK != cfg.block_size || h.TOPB != cfg.top_blocks ||
+            h.WINDOW != cfg.window || h.TOPK != K || h.TMAX != Tmax)
+            throw std::runtime_error("检查点配置与当前训练器不匹配");
+        std::uint64_t 已读 = sizeof(h);
+        auto rd = [&](void* p, std::size_t n) {
+            rf.read(reinterpret_cast<char*>(p), std::streamsize(n));
+            if (!rf) throw std::runtime_error("检查点读取截断: " + 路径);
+            已读 += n;
+        };
+        auto 载i8 = [&](vk张量& t, std::size_t n) {
+            std::vector<std::int8_t> b(n);
+            if (n) rd(b.data(), n);
+            if (n) t.上传(b.data(), n);
+        };
+        auto 载f32 = [&](vk张量& t, std::size_t n) {
+            std::vector<float> b(n);
+            if (n) rd(b.data(), n * 4);
+            if (n) t.上传(b.data(), n * 4);
+        };
+        auto 载标量 = [&]() { float v = 0.0f; rd(&v, sizeof(float)); return v; };
+        auto 载量化 = [&](参数* p) {
+            载i8(p->i8, p->n);
+            载f32(p->s, std::size_t(p->rows) * p->G);
+        };
+
+        载i8(embed->i8, std::size_t(V) * D);
+        {
+            std::vector<float> s(static_cast<std::size_t>(V));
+            rd(s.data(), s.size() * sizeof(float));
+            embed->s.上传(s.data(), s.size() * sizeof(float));
+        }
+        载i8(lmhead->i8, std::size_t(V) * D);
+        载f32(lmhead->s, std::size_t(V) * Gd);
+        载f32(finalNorm->p, D);
+
+        for (auto& L : 层表) {
+            auto 载GR = [&](参数* ng, 参数* rw, 参数* rb, 参数* ww, 参数* wb) {
+                载f32(ng->p, 4 * std::size_t(D));
+                载f32(rw->p, 4 * 4 * std::size_t(D));
+                载f32(rb->p, 4);
+                载f32(ww->p, 4 * std::size_t(D));
+                载f32(wb->p, 4);
+            };
+            载GR(L.g1ng, L.g1rw, L.g1rb, L.g1ww, L.g1wb);
+            载GR(L.g2ng, L.g2rw, L.g2rb, L.g2ww, L.g2wb);
+            载量化(L.Wq); 载量化(L.Wk); 载量化(L.Wv); 载量化(L.Wo);
+            if (L.ersa) {
+                L.sink_value = 载标量();
+                if (L.sink != nullptr && L.sink->p.布局().元素总数 > 0)
+                    L.sink->p.上传(&L.sink_value, sizeof(float));
+                载f32(L.outNorm->p, D);
+            } else {
+                载f32(L.etaW->p, D);
+                载f32(L.etaB->p, 1);
+                载f32(L.slotK->p, std::size_t(M) * DK);
+                载f32(L.gamma->p, M);
+                L.beta_null = 载标量();
+                if (L.betaNull != nullptr && L.betaNull->p.布局().元素总数 > 0)
+                    L.betaNull->p.上传(&L.beta_null, sizeof(float));
+                载f32(L.outNorm->p, D);
+            }
+            载f32(L.gate->p, std::size_t(E) * D);
+            载i8(L.moe_W1_i8, std::size_t(E) * F * D);
+            载f32(L.moe_W1_s, std::size_t(E) * F * Gd);
+            载i8(L.moe_W2_i8, std::size_t(E) * D * F);
+            载f32(L.moe_W2_s, std::size_t(E) * D * Gf);
+            载量化(L.shW1); 载量化(L.shWup); 载量化(L.shW2);
+        }
+        char extra = 0;
+        if (rf.read(&extra, 1)) throw std::runtime_error("检查点尾部有多余数据: " + 路径);
+        rf.close();
+
+        const std::string 状态路径 = 路径 + ".opt";
+        std::ifstream of(状态路径, std::ios::binary);
+        if (!of) throw std::runtime_error("缺少优化器状态文件: " + 状态路径);
+        char omagic[8] = {};
+        of.read(omagic, 8);
+        if (!of || std::memcmp(omagic, "ASMOPT01", 8) != 0)
+            throw std::runtime_error("不是 ASMOPT01 优化器状态: " + 状态路径);
+        auto rdu32 = [&]() {
+            std::uint32_t v = 0;
+            of.read(reinterpret_cast<char*>(&v), 4);
+            if (!of) throw std::runtime_error("优化器状态读取截断: " + 状态路径);
+            return v;
+        };
+        auto rdu64 = [&]() {
+            std::uint64_t v = 0;
+            of.read(reinterpret_cast<char*>(&v), 8);
+            if (!of) throw std::runtime_error("优化器状态读取截断: " + 状态路径);
+            return v;
+        };
+        auto rdf = [&]() {
+            float v = 0.0f;
+            of.read(reinterpret_cast<char*>(&v), 4);
+            if (!of) throw std::runtime_error("优化器状态读取截断: " + 状态路径);
+            return v;
+        };
+        if (rdu32() != 1) throw std::runtime_error("优化器状态版本不支持");
+        const std::uint32_t 记录数 = rdu32();
+        const std::uint64_t 存档步数 = rdu64();
+        const std::uint64_t 权重字节 = rdu64();
+        (void)rdu32();
+        (void)rdu32();
+        if (权重字节 != 已读) throw std::runtime_error("权重与优化器状态文件不配套: " + 路径);
+        std::uint32_t 恢复记录 = 0;
+        for (std::uint32_t ri = 0; ri < 记录数; ++ri) {
+            const std::uint32_t 名长 = rdu32();
+            const std::uint32_t 标志 = rdu32();
+            const std::uint64_t 元素 = rdu64();
+            const std::uint32_t 优化步数 = rdu32();
+            const std::uint32_t 种子 = rdu32();
+            const std::uint32_t 模式 = rdu32();
+            const std::uint32_t 行 = rdu32();
+            const std::uint32_t 列 = rdu32();
+            const std::uint32_t G组 = rdu32();
+            const float 上一范数 = rdf();
+            const std::uint32_t P长 = rdu32();
+            const std::uint32_t R长 = rdu32();
+            std::string 名(名长, '\0');
+            if (名长) of.read(名.data(), std::streamsize(名长));
+            if (!of) throw std::runtime_error("优化器状态读取截断: " + 状态路径);
+            参数* q = nullptr;
+            for (auto& cand : 全部参数) {
+                if (cand->名 == 名) { q = cand.get(); break; }
+            }
+            if (q == nullptr) throw std::runtime_error("优化器记录找不到参数: " + 名);
+            if (元素 != q->n) throw std::runtime_error("参数元素数不匹配: " + 名);
+            if ((标志 & 8u) && q->p.布局().元素总数 != q->n)
+                throw std::runtime_error("缺少 fp32 主副本: " + 名);
+            if ((标志 & 1u) && (q->m.布局().元素总数 != q->n || q->v.布局().元素总数 != q->n))
+                throw std::runtime_error("缺少 AdamW 矩状态: " + 名);
+            if ((标志 & 2u) && q->mini == nullptr) throw std::runtime_error("缺少 ApolloMini 实例: " + 名);
+            if ((标志 & 4u) && q->miniI8 == nullptr) throw std::runtime_error("缺少 ApolloMiniI8 实例: " + 名);
+            if (标志 & 8u) {
+                std::vector<float> b(q->n);
+                of.read(reinterpret_cast<char*>(b.data()), std::streamsize(b.size() * 4));
+                if (!of) throw std::runtime_error("优化器状态读取截断: " + 状态路径);
+                q->p.上传(b.data(), b.size() * 4);
+            }
+            if (标志 & 1u) {
+                std::vector<float> b(q->n);
+                of.read(reinterpret_cast<char*>(b.data()), std::streamsize(b.size() * 4));
+                if (!of) throw std::runtime_error("优化器状态读取截断: " + 状态路径);
+                q->m.上传(b.data(), b.size() * 4);
+                of.read(reinterpret_cast<char*>(b.data()), std::streamsize(b.size() * 4));
+                if (!of) throw std::runtime_error("优化器状态读取截断: " + 状态路径);
+                q->v.上传(b.data(), b.size() * 4);
+            }
+            std::vector<float> P(P长), Mv(R长), Vv(R长);
+            if (!P.empty()) of.read(reinterpret_cast<char*>(P.data()), std::streamsize(P.size() * 4));
+            if (!Mv.empty()) of.read(reinterpret_cast<char*>(Mv.data()), std::streamsize(Mv.size() * 4));
+            if (!Vv.empty()) of.read(reinterpret_cast<char*>(Vv.data()), std::streamsize(Vv.size() * 4));
+            if (!of) throw std::runtime_error("优化器状态读取截断: " + 状态路径);
+            if (标志 & 2u) {
+                if (q->mini->行数() != 行 || q->mini->列数() != 列 || q->mini->种子() != 种子)
+                    throw std::runtime_error("ApolloMini 形状/seed 不匹配: " + 名);
+                q->mini->导入状态(P, Mv, Vv, 优化步数, 上一范数);
+            }
+            if (标志 & 4u) {
+                if (q->miniI8->行数() != 行 || q->miniI8->列数() != 列 ||
+                    q->miniI8->种子() != 种子 || q->miniI8->尺度组数() != G组)
+                    throw std::runtime_error("ApolloMiniI8 形状/seed 不匹配: " + 名);
+                q->miniI8->导入状态(P, Mv, Vv, 优化步数, 上一范数);
+            }
+            ++恢复记录;
+        }
+        char oextra = 0;
+        if (of.read(&oextra, 1)) throw std::runtime_error("优化器状态尾部有多余数据: " + 状态路径);
+        of.close();
+        已训步数 = 存档步数;
+        std::printf("检查点已加载: %s | 优化器记录=%u | 步数=%llu\n",
+                    路径.c_str(), 恢复记录, static_cast<unsigned long long>(已训步数));
+    };
+
+#ifndef ASM_TRAINER_LIBRARY
+    if (const char* 载入路径 = std::getenv("ASM_RESUME")) {
+        if (*载入路径) 加载权重(载入路径);
+    }
+#endif
+
     // 全局前向缓冲
     vk张量 branches = 建({B, 4, D}, 张量类型::浮点32, "branches");
     vk张量 out_tokens = 建({Tmax, D}, 张量类型::浮点32, "out_tokens");
@@ -2157,6 +2353,17 @@ int main(int argc, char** argv) {
             }
             const AsmTrainerStats saved = bridge.last_stats();
             bridge.publish(saved);
+            continue;
+        }
+        if (command == TrainerBridge::Command::Load) {
+            try {
+                加载权重(bridge.take_load_path());
+            } catch (const std::exception& e) {
+                bridge.fail(e.what());
+            }
+            AsmTrainerStats loaded = bridge.last_stats();
+            loaded.step = 已训步数;
+            bridge.publish(loaded);
             continue;
         }
 

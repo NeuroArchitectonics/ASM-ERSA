@@ -20,6 +20,8 @@ def main() -> None:
     parser.add_argument("--debug-bf16", action="store_true")
     parser.add_argument("--save", type=Path, default=None,
                         help="保存检查点路径：写 ASM8BIN 权重和同名 .opt 优化器状态")
+    parser.add_argument("--resume", type=Path, default=None,
+                        help="加载检查点路径，恢复权重/优化器状态后继续训练")
     args = parser.parse_args()
 
     with Trainer(
@@ -30,6 +32,9 @@ def main() -> None:
         debug_bf16=args.debug_bf16,
     ) as trainer:
         print(f"ASM trainer {trainer.version}")
+        if args.resume is not None:
+            trainer.load_checkpoint(args.resume)
+            print(f"resumed from {args.resume} step={trainer.get_stats().step}")
         for _ in range(args.steps):
             stats = trainer.train_step()
             print(
