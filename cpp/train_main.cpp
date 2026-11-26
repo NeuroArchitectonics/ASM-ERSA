@@ -319,6 +319,7 @@ int trainer_worker_main(const AsmTrainerConfig& 库配置, const std::string& sp
     const std::string spv目录 = spv_dir;
     const std::string 模式 = "3b_train";
     const bool smoke = false;
+    const bool big8b = false;
     const bool big6b = false;
     const bool big3b = true;
     const bool 训练循环 = true;
@@ -1632,15 +1633,17 @@ int main(int argc, char** argv) {
                moeIdxS.取句柄(), moeKwS.取句柄(), moeShSilu.取句柄()},
               &mdx, sizeof(mdx), T, 1, 1);
         const std::uint32_t ftiles = (F + 127u) / 128u;
-        const MoeDxSharedPC mds{T, D, F, Gd, Gf, 128u, 0};
-        提交2("moe_bwd_dx_shared_i8",
-              {moeXs.取句柄(), moeDys.取句柄(),
-               L.shW1->i8.取句柄(), L.shW1->s.取句柄(),
-               L.shWup->i8.取句柄(), L.shWup->s.取句柄(),
-               L.shW2->i8.取句柄(), L.shW2->s.取句柄(),
-               moeShPre.取句柄(), moeShUp.取句柄(), moeShHq.取句柄(),
-               moeShDh.取句柄(), moeShSilu.取句柄(), dX2All.取句柄()},
-              &mds, sizeof(mds), T, ftiles, 1);
+        for (std::uint32_t tile = 0; tile < ftiles; ++tile) {
+            const MoeDxSharedPC mds{T, D, F, Gd, Gf, 128u, tile};
+            提交2("moe_bwd_dx_shared_i8",
+                  {moeXs.取句柄(), moeDys.取句柄(),
+                   L.shW1->i8.取句柄(), L.shW1->s.取句柄(),
+                   L.shWup->i8.取句柄(), L.shWup->s.取句柄(),
+                   L.shW2->i8.取句柄(), L.shW2->s.取句柄(),
+                   moeShPre.取句柄(), moeShUp.取句柄(), moeShHq.取句柄(),
+                   moeShDh.取句柄(), moeShSilu.取句柄(), dX2All.取句柄()},
+                  &mds, sizeof(mds), T, 1, 1);
+        }
 
         // gr_route 也按序列并行：读连续 [T,*] 记录，权重梯度按 token 输出后归约。
         const GrRouteBwdPC rr{T, D, 0, 0};
@@ -1721,38 +1724,44 @@ int main(int argc, char** argv) {
         }
 
         if (L.ersa) {
-            // context 段块路由反向 + query 段 IVF 反向，都按序列并行；
-            // dK/dV/dsink 用原子累加合并到同一 cache 梯度。
+            // context 与 query 都按 query 串行，dK/dV/dsink 的累加顺序固定。
             if (bwd_cache && Nctx > 0) {
-                const ErsaBwdPC ep{1, H, T, 0, DK, DV, 0, cfg.block_size,
-                                   cfg.top_blocks, cfg.window, 0, NBmaxT, 0.005f,
-                                   L.sink_value, 0.0f, 0.0f};
-                提交2("ersa_attn_bwd_query",
-                      {L.q_hist.取句柄(), L.k_cache.取句柄(), L.v_cache.取句柄(),
-                       L.block_sum.取句柄(), dOAll.取句柄(), dQH.取句柄(),
-                       dKH.取句柄(), dVH.取句柄(), dSinkH.取句柄()},
-                      &ep, sizeof(ep), H * Nctx, 1, 1);
+                for (std::uint32_t tq = 0; tq < Nctx; ++tq) {
+                    ErsaBwdPC ep{1, H, T, Nctx, DK, DV, 0, cfg.block_size,
+                                 cfg.top_blocks, cfg.window, tq, NBmaxT, 0.005f,
+                                 L.sink_value, 0.0f, 0.0f};
+                    提交2("ersa_attn_bwd_query",
+                          {L.q_hist.取句柄(), L.k_cache.取句柄(), L.v_cache.取句柄(),
+                           L.block_sum.取句柄(), dOAll.取句柄(), dQH.取句柄(),
+                           dKH.取句柄(), dVH.取句柄(), dSinkH.取句柄()},
+                          &ep, sizeof(ep), H, 1, 1);
+                }
             }
             if (bwd_cache) {
-                const IvfPc bp{B, H, T, T, DK, DV, IVFC, IVFLMAX,
-                               IVFTOPB, IVFWIN, Nctx, 0, 0.005f, L.sink_value};
-                提交2("ersa_ivf_attn_bwd_cand",
-                      {L.q_hist.取句柄(), L.k_cache.取句柄(), L.v_cache.取句柄(),
-                       L.candSnapSeq.取句柄(), L.candCntSeq.取句柄(),
-                       dOAll.取句柄(), dQH.取句柄(), dKH.取句柄(),
-                       dVH.取句柄(), dSinkH.取句柄()},
-                      &bp, sizeof(bp), H * Tq, 1, 1);
+                for (std::uint32_t tq = 0; tq < Tq; ++tq) {
+                    const IvfPc bp{B, H, T, T, DK, DV, IVFC, IVFLMAX,
+                                   IVFTOPB, IVFWIN, Nctx, tq, 0.005f, L.sink_value};
+                    提交2("ersa_ivf_attn_bwd_cand",
+                          {L.q_hist.取句柄(), L.k_cache.取句柄(), L.v_cache.取句柄(),
+                           L.candSnapSeq.取句柄(), L.candCntSeq.取句柄(),
+                           dOAll.取句柄(), dQH.取句柄(), dKH.取句柄(),
+                           dVH.取句柄(), dSinkH.取句柄()},
+                          &bp, sizeof(bp), H, 1, 1);
+                }
             } else {
-                const ErsaBwdPC ep{1, H, T, 0, DK, DV, 0, cfg.block_size,
-                                   cfg.top_blocks, cfg.window, 0, NBmaxT, 0.005f,
-                                   L.sink_value, 0.0f, 0.0f};
-                提交2("ersa_attn_bwd_query",
-                      {L.q_hist.取句柄(),
-                       (cache_mode ? L.k_cache : L.k_hist).取句柄(),
-                       (cache_mode ? L.v_cache : L.v_hist).取句柄(),
-                       L.block_sum.取句柄(), dOAll.取句柄(), dQH.取句柄(),
-                       dKH.取句柄(), dVH.取句柄(), dSinkH.取句柄()},
-                      &ep, sizeof(ep), H * T, 1, 1);
+                // 同上：按 query 逐个派发，保证累加顺序固定
+                for (std::uint32_t tq = 0; tq < T; ++tq) {
+                    ErsaBwdPC ep{1, H, T, T, DK, DV, 0, cfg.block_size,
+                                 cfg.top_blocks, cfg.window, tq, NBmaxT, 0.005f,
+                                 L.sink_value, 0.0f, 0.0f};
+                    提交2("ersa_attn_bwd_query",
+                          {L.q_hist.取句柄(),
+                           (cache_mode ? L.k_cache : L.k_hist).取句柄(),
+                           (cache_mode ? L.v_cache : L.v_hist).取句柄(),
+                           L.block_sum.取句柄(), dOAll.取句柄(), dQH.取句柄(),
+                           dKH.取句柄(), dVH.取句柄(), dSinkH.取句柄()},
+                          &ep, sizeof(ep), H, 1, 1);
+                }
             }
 
             const L2BwdPC l2q{H * T, DK, 0, 1};
