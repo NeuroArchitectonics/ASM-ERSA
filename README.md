@@ -7,8 +7,16 @@
 > **状态（2026-11-25）**：主运行路径为 `cpp/` 的 C++ + Vulkan INT8 融合实现（`ASM_ERSAModel`，INT8×INT8，ASM8BIN 权重）。
 > `asm_ersa` Python 包保留为机制参考/数值 oracle，不作为运行时主路径。
 > 3B Vulkan 训练器已跑通训练全链路；Radeon 780M 实测 VK live **9.58 GiB**。
-> Vulkan 反向/优化器 kernel 见 `反向/`、`优化器/`；训练入口为 `cpp/train_main.cpp`。
-> 下文性能表与部分机制描述仍沿用旧口径（标 ⚠️ 处未复核），正在按 ASM-ERSA 设计重写，请以代码为准。
+
+### 8B 配置（`cpp/build/train_main.exe cpp/spv 8b_cache|8b_train`）
+
+| 项 | 值 |
+|---|---|
+| 骨架 | 24 层 / d=2048 / d_ff=384 / top-4 / tied embed，专家 192 |
+| 总参 / 激活 | **8.032B / 0.935B（11.6%）** |
+| VK live | **24.85 GiB** |
+| 单步耗时 | fwd ~0.70 s / bwd 2.7–5.6 s / upd **0.80 s** |
+
 
 ---
 

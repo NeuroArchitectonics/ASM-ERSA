@@ -609,6 +609,7 @@ class ASM_ERSA_Omni(nn.Module):
         audio_output_mode: str = 'discrete',
         n_audio_tokens: int = 8192,
         state_grad_chunk: int = 128,
+        tie_embeddings: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -629,7 +630,7 @@ class ASM_ERSA_Omni(nn.Module):
             n_audio_experts=n_audio_experts, n_vision_experts=n_vision_experts,
             top_k=top_k, audio_config=audio_config, vision_config=vision_config,
             audio_output_mode=audio_output_mode, n_audio_tokens=n_audio_tokens,
-            state_grad_chunk=state_grad_chunk,
+            state_grad_chunk=state_grad_chunk, tie_embeddings=tie_embeddings,
         )
 
         self.text_embed = nn.Embedding(vocab_size, d_model)
@@ -676,6 +677,9 @@ class ASM_ERSA_Omni(nn.Module):
 
         self.out_norm = RMSNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+        if tie_embeddings:
+            # 6B-lite：lm_head 与词嵌入共享权重，省一份 V×D（311M）
+            self.lm_head.weight = self.text_embed.weight
         self.audio_head = AudioOutputHead(d_model, n_audio_tokens, audio_output_mode)
 
         # 音频生成段：<audio_start> 特殊 token + 音频码本嵌入表。

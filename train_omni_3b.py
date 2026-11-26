@@ -92,6 +92,8 @@ class TrainConfig:
     n_audio_experts: int = 6
     n_vision_experts: int = 6
     top_k: int = 4
+    optimizer: str = 'adamw'            # 'adamw' | 'apollo'（6B-lite 走 apollo）
+    tie_embeddings: bool = False        # True: lm_head 与词嵌入共享（6B-lite 用）
     audio_output_mode: str = 'discrete'
     n_audio_tokens: int = 1024          # = EncodecTokenizer.codebook_size（asm_ersa/audio_codec.py）
 
@@ -148,6 +150,26 @@ class TrainConfig:
 
     # 输出
     output_dir: str = './checkpoints/asm_ersa-omni-3b'
+
+
+def TrainConfig6BLite() -> TrainConfig:
+    """6B-lite：总参 ~5.99B、每 token 激活 ~0.93B。
+
+    与 3B 同宽（D=2048）、同 expert 尺寸（F=384），靠三处改动把总参顶到 6B 同时压住激活：
+      - n_layers 32 → 24（token_mixing 是全激活项，与层数线性）
+      - 专家 32 → 138（top-4，激活比例 4/138 ≈ 2.9%），按 3B 的模态分区比例放大
+      - tie_embeddings=True（lm_head 与词嵌入共享，省一份 311M）
+    """
+    c = TrainConfig()
+    c.n_layers = 24
+    c.n_shared_experts = 34
+    c.n_text_experts = 52
+    c.n_audio_experts = 26
+    c.n_vision_experts = 26
+    c.tie_embeddings = True
+    c.optimizer = 'apollo_mini'
+    c.output_dir = './checkpoints/asm_ersa-omni-6b-lite'
+    return c
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -762,6 +784,7 @@ def build_model(cfg: TrainConfig) -> ASM_ERSA_Omni:
         top_k=cfg.top_k,
         audio_output_mode=cfg.audio_output_mode,
         n_audio_tokens=cfg.n_audio_tokens,
+        tie_embeddings=cfg.tie_embeddings,
         audio_config={
             'n_mels': cfg.n_mels,
             'patch_size': 4,
@@ -777,7 +800,13 @@ def build_model(cfg: TrainConfig) -> ASM_ERSA_Omni:
 
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log.info(f"模型参数: total={total / 1e9:.2f}B, trainable={trainable / 1e9:.2f}B")
+    expert = sum(p.numel() for n, p in model.named_parameters()
+                 if '.moe.W1' in n or '.moe.W2' in n)
+    n_exp = (cfg.n_shared_experts + cfg.n_text_experts
+             + cfg.n_audio_experts + cfg.n_vision_experts)
+    active = total - expert + expert * cfg.top_k // max(1, n_exp)
+    log.info(f"模型参数: total={total / 1e9:.2f}B, trainable={trainable / 1e9:.2f}B, "
+             f"active={active / 1e9:.3f}B (top{cfg.top_k}/{n_exp}), tied_embed={cfg.tie_embeddings}")
 
     ersa_count = sum(1 for l in model.layers if hasattr(l, 'is_ersa') and l.is_ersa)
     gdn_count = len(model.layers) - ersa_count
@@ -864,6 +893,10 @@ def get_tokenizer(vocab_size: int):
 # ═══════════════════════════════════════════════════════════════
 
 def train(cfg: TrainConfig):
+    if cfg.optimizer != 'adamw':
+        raise SystemExit(
+            f"train_omni_3b.py 只提供 AdamW 参考训练；optimizer={cfg.optimizer!r} 请走 "
+            "VK 训练器（cpp/train_main.cpp，ASM_OPT=apollo）")
     rank, world_size, local_rank = setup_distributed()
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
 

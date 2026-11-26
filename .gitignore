@@ -142,3 +142,8 @@ ASM-ERSA/
 
 # Vulkan 着色器源码不随仓库发布：只提交 spv/ 下的编译产物（.spv / .spv.hpp）
 *.comp
+
+# 本地存档/私有文档，不入库
+archives/
+cpp/主模型VK反向规划.md
+docs/整机卡死排查手册.md

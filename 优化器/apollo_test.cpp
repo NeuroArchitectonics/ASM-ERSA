@@ -55,6 +55,9 @@ int main(int argc, char** argv) {
         const double beta = 配置.beta;
         const double c1 = beta * (1.0 - std::pow(beta, s - 1.0)) / (1.0 - std::pow(beta, s));
         const double c2 = (1.0 - beta) / (1.0 - std::pow(beta, s));
+        if (s == 1) {
+            for (std::size_t i = 0; i < N; ++i) b[i] = 梯度[0][i] * 梯度[0][i];
+        }
         std::vector<double> mn(N);
         double s1 = 0, s2 = 0, s3 = 0;
         for (std::size_t i = 0; i < N; ++i) {

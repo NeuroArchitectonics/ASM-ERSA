@@ -12,14 +12,20 @@ struct 归约推送 {
     float beta;
     float c1;
     float c2;
+    std::uint32_t init_b;
+    std::uint32_t pad0, pad1, pad2;
 };
+static_assert(sizeof(归约推送) == 32, "apollo_reduce push");
 
 struct 更新推送 {
     std::uint32_t 元素数;
     float alpha;
     float 学习率;
     float sigma;
+    float b_max;
+    float pad0, pad1, pad2;
 };
+static_assert(sizeof(更新推送) == 32, "apollo_update push");
 }  // namespace
 
 ApolloSolver::ApolloSolver(vk张量& 参数, vk张量& 梯度, std::size_t 元素数, 配置 配置)
@@ -61,6 +67,7 @@ void ApolloSolver::步骤() {
 
     const 归约推送 归约参数{
         static_cast<std::uint32_t>(元素数_), 配置_.beta, c1, c2,
+        (当前步数_ == 1u ? 1u : 0u), 0u, 0u, 0u,
     };
     流水线调度器::获取().录制自定义派发算子(
         "apollo_reduce",
@@ -76,6 +83,7 @@ void ApolloSolver::步骤() {
     const std::uint32_t 组数 = static_cast<std::uint32_t>((元素数_ + 255) / 256);
     const 更新推送 更新参数{
         static_cast<std::uint32_t>(元素数_), alpha, 配置_.学习率, 配置_.sigma,
+        配置_.b_max, 0.0f, 0.0f, 0.0f,
     };
     流水线调度器::获取().录制自定义派发算子(
         "apollo_update",

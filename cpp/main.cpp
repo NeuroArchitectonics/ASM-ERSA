@@ -4,6 +4,7 @@
 #include "流水线调度器.hpp"
 #include "cpp/spv/stream_read.spv.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -13,6 +14,14 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <memory>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#endif
 
 using namespace vk张量系统;
 using namespace asm_ersa_model;
@@ -52,6 +61,116 @@ int main(int argc, char** argv) {
     }
 
     const std::string mode = (argc >= 3) ? argv[2] : "";
+    if (mode == "8b" || mode == "8bparams") {
+        const ModelConfig c8 = ModelConfig8B();
+        const std::uint64_t 总参 = count_params(c8, true);
+        const std::uint64_t 激活 = count_active_params(c8, true);
+        std::printf("[8B] layers=%u d=%u ff=%u experts=%u top_k=%u | 总参 %.3fB | 激活 %.3fB (%.1f%%)\n",
+                    c8.n_layers, c8.d_model, c8.d_ff, c8.n_experts, c8.moe_top_k,
+                    double(总参) / 1e9, double(激活) / 1e9,
+                    100.0 * double(激活) / double(总参));
+        return 0;
+    }
+    if (mode == "6b" || mode == "--6b" || mode == "6bparams") {
+        const ModelConfig c6 = ModelConfig6BLite();
+        const std::uint64_t tot = count_params(c6, true);
+        const std::uint64_t act = count_active_params(c6, true);
+        std::printf("6B-lite: layers=%u D=%u H=%u F=%u E=%u topk=%u tied_embed=1\n",
+                    c6.n_layers, c6.d_model, c6.n_heads, c6.d_ff, c6.n_experts, c6.moe_top_k);
+        std::printf("total=%.3fB active=%.3fB (%.1f%%)\n",
+                    double(tot) / 1e9, double(act) / 1e9,
+                    100.0 * double(act) / double(tot));
+        std::printf("INT8 weights ~%.2f GB | FP16 ~%.2f GB | train ~%.1f GB (16B/param)\n",
+                    double(tot) * 1.031 / 1e9, double(tot) * 2 / 1e9, double(tot) * 16 / 1e9);
+        sched.停止();
+        return 0;
+    }
+    if (mode == "6bmem" || mode == "--6bmem") {
+        const ModelConfig c6 = ModelConfig6BLite();
+        const std::uint64_t tot = count_params(c6, true);
+        std::printf("6B-lite: params=%.3fB, active=%.3fB\n",
+                    double(tot) / 1e9,
+                    double(count_active_params(c6, true)) / 1e9);
+        auto 报RSS = [](const char* 标) {
+#ifdef _WIN32
+            PROCESS_MEMORY_COUNTERS pmc{};
+            GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
+            std::printf("  [%s] RSS=%.2f GB peak=%.2f GB\n", 标,
+                        double(pmc.WorkingSetSize) / 1e9, double(pmc.PeakWorkingSetSize) / 1e9);
+#else
+            (void)标;
+#endif
+        };
+        auto 主机分配 = [&](std::uint64_t bytes, const char* 名) {
+            // 单阶段分配：测完即释放，避免主机与 GTT（共享同一物理内存）叠加爆表
+            std::vector<std::unique_ptr<char[]>> 块;
+            块.reserve(64);
+            const auto t0 = std::chrono::steady_clock::now();
+            std::uint64_t done = 0;
+            while (done < bytes) {
+                const std::size_t n = static_cast<std::size_t>(
+                    std::min<std::uint64_t>(1ull << 30, bytes - done));
+                auto p = std::make_unique<char[]>(n);
+                std::memset(p.get(), 1, n);   // 触页，计入 RSS
+                块.push_back(std::move(p));
+                done += n;
+            }
+            const double s = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count();
+            std::printf("%-14s %.2f GB  (%.2f s)\n", 名, double(bytes) / 1e9, s);
+            报RSS(名);
+        };
+        主机分配(tot * 4, "fp32 params");
+        主机分配(tot * 2, "bf16 params");
+        主机分配(tot, "int8 weights");
+
+        // GPU：INT8 权重实际分配（每块 ≤2e9 元素，避开 vk张量 的 uint32 形状上限）
+        std::vector<std::unique_ptr<vk张量>> gpu块;
+        std::uint64_t 剩余 = tot;
+        const auto gt0 = std::chrono::steady_clock::now();
+        try {
+            while (剩余 > 0) {
+                const std::uint32_t n = static_cast<std::uint32_t>(
+                    std::min<std::uint64_t>(2000000000ull, 剩余));
+                gpu块.push_back(std::make_unique<vk张量>(
+                    张量布局::连续({n}), 张量类型::整数8, "mem_int8"));
+                剩余 -= n;
+            }
+            const double s = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - gt0).count();
+            std::printf("GPU INT8 weights: %.2f GB allocated (%.2f s)\n",
+                        double(tot) / 1e9, s);
+        } catch (const std::exception& e) {
+            std::printf("GPU INT8 allocation failed after %.2f GB: %s\n",
+                        double(tot - 剩余) / 1e9, e.what());
+        }
+
+        // 训练态：主机 fp32 梯度（APOLLO-Mini 状态另计 ~80 MB）
+        主机分配(tot * 4, "fp32 grads");
+        // GPU 训练态：再试 24 GB fp32 梯度（780M 的 GTT 上限读数）
+        std::uint64_t 剩余2 = tot * 4;
+        const auto gt1 = std::chrono::steady_clock::now();
+        try {
+            while (剩余2 > 0) {
+                const std::uint32_t n = static_cast<std::uint32_t>(
+                    std::min<std::uint64_t>(1000000000ull, 剩余2 / 4));
+                gpu块.push_back(std::make_unique<vk张量>(
+                    张量布局::连续({n}), 张量类型::浮点32, "mem_f32"));
+                剩余2 -= std::uint64_t(n) * 4;
+            }
+            const double s = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - gt1).count();
+            std::printf("GPU fp32 grads: %.2f GB allocated (%.2f s)\n",
+                        double(tot * 4) / 1e9, s);
+        } catch (const std::exception& e) {
+            std::printf("GPU fp32 grads failed after %.2f GB: %s\n",
+                        double(tot * 4 - 剩余2) / 1e9, e.what());
+        }
+
+        // 不探测 48GB：780M 的 GTT 与主机是同一块物理内存，主机已占 70GB+ 时再叠加会爆系统内存。
+        sched.停止();
+        return 0;
+    }
     if (mode == "membw" || mode == "--membw") {
         const uint32_t words = 1u << 27;                 // 512 MB
         const uint32_t grid = 128;

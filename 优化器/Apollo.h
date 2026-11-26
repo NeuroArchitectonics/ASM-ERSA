@@ -14,6 +14,7 @@ public:
         float 学习率 = 1e-3f;
         float sigma = 1e-4f;
         float epsilon = 1e-8f;
+        float b_max = 3.402823466e38f;   // |B| 上界；FLT_MAX 等价不启用
     };
 
     explicit Apollo(std::size_t 元素数, 配置 配置 = {});

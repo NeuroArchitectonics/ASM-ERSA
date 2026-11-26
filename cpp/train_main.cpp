@@ -52,6 +52,7 @@
 #include "spv/apollo_reduce.spv.hpp"
 #include "spv/apollo_update.spv.hpp"
 #include "cpp/spv/apollo_mini_proj.spv.hpp"
+#include "cpp/spv/apollo_mini_normsum.spv.hpp"
 #include "cpp/spv/apollo_mini_stat.spv.hpp"
 #include "cpp/spv/apollo_mini_apply.spv.hpp"
 #include "cpp/spv/apollo_mini_apply_i8.spv.hpp"
@@ -332,10 +333,11 @@ int main(int argc, char** argv) {
     const std::string spv目录 = argv[1];
     const std::string 模式 = (argc >= 3) ? argv[2] : "";
     const bool smoke = (模式 == "smoke");
-    const bool big6b = (模式 == "6b_cache" || 模式 == "6b_train");
+    const bool big8b = (模式 == "8b_cache" || 模式 == "8b_train");
+    const bool big6b = (模式 == "6b_cache" || 模式 == "6b_train" || big8b);
     const bool big3b = (模式 == "3b_cache" || 模式 == "3b_cache_smoke" || 模式 == "3b_train" || big6b);
     // 训练循环（每步 fwd/bwd/upd）：3b_train / 6b_train 共用
-    const bool 训练循环 = (模式 == "3b_train" || 模式 == "6b_train");
+    const bool 训练循环 = (模式 == "3b_train" || 模式 == "6b_train" || 模式 == "8b_train");
     const int 步数 = smoke ? 0 : ((argc >= 3) ? std::atoi(argv[2]) : 4);
 #endif
 
@@ -425,7 +427,8 @@ int main(int argc, char** argv) {
         cfg.moe_top_k = 4;
         cfg.max_seq_len = 16;
     }
-    if (big6b) cfg = asm_ersa_model::ModelConfig6BLite();   // 24 层 / 138 专家 / top-4
+    if (big8b) cfg = asm_ersa_model::ModelConfig8B();       // 24 层 / 184 专家 / top-4
+    else if (big6b) cfg = asm_ersa_model::ModelConfig6BLite();   // 24 层 / 138 专家 / top-4
 
     // cache0/cachefull：无 context / 全候选，用同一候选集对拍 block/cache。
     const bool parity0 = (模式 == "cache0" || 模式 == "cache0_smoke");
@@ -786,14 +789,13 @@ int main(int argc, char** argv) {
                 mc.scale = mini_scale;
                 const std::uint32_t seed1 = 20261124u + 模型seed + L.W1->n;
                 const std::uint32_t seed2 = 20261124u + 模型seed + L.W2->n;
+                // 梯度已按前向布局写：W1=[E*F, D]、W2=[E*D, F]，与权重视图一致 ⇒ 直接用线性 apply。
                 L.W1->miniI8 = std::make_unique<ApolloMiniI8>(
-                    L.moe_W1_i8, L.moe_W1_s, L.W1->g, E * D, F, mc, seed1,
-                    (D + 127u) / 128u, L.W1->梯度bf16,
-                    ApolloMiniI8::MoE直写布局{E, F, D, 1u});
+                    L.moe_W1_i8, L.moe_W1_s, L.W1->g, E * F, D, mc, seed1,
+                    (D + 127u) / 128u, L.W1->梯度bf16, ApolloMiniI8::MoE直写布局{});
                 L.W2->miniI8 = std::make_unique<ApolloMiniI8>(
-                    L.moe_W2_i8, L.moe_W2_s, L.W2->g, E * F, D, mc, seed2,
-                    (F + 127u) / 128u, L.W2->梯度bf16,
-                    ApolloMiniI8::MoE直写布局{E, F, D, 2u});
+                    L.moe_W2_i8, L.moe_W2_s, L.W2->g, E * D, F, mc, seed2,
+                    (F + 127u) / 128u, L.W2->梯度bf16, ApolloMiniI8::MoE直写布局{});
             }
         }
 
@@ -1901,7 +1903,11 @@ int main(int argc, char** argv) {
         冲刷批();
         填零(dBranchUpperAll);
         const float loss = 反向头();
-        for (int li = int(cfg.n_layers) - 1; li >= 0; --li) 反向层(std::uint32_t(li));
+        const bool 跟踪 = std::getenv("ASM_TRACE") != nullptr;
+        for (int li = int(cfg.n_layers) - 1; li >= 0; --li) {
+            if (跟踪) std::printf("[trace] bwd L%d\n", li);
+            反向层(std::uint32_t(li));
+        }
 
         // layer0 的融合后处理已经写好 dEmbedAll。
         {
@@ -2017,8 +2023,41 @@ int main(int argc, char** argv) {
                 层表[0].moe_W1_i8.下载(w1前.data(), w1前.size());
                 层表[0].moe_W2_i8.下载(w2前.data(), w2前.size());
             }
+            const bool 跟踪更新 = std::getenv("ASM_TRACE") != nullptr;
+            // 相位批量化（ASM_UPDATE_PACE=0 可退回逐参数旧路径）：
+            //   A) 全部参数一次性派发 proj/stat/gnorm（只录制）
+            //   B) 逐个 结算()：第一次 下载 会同步等完 A 的所有任务，后续都是即时读
+            //   C) 全部参数一次性派发 apply，最后一次 冲刷批() 收尾
+            const char* pace_env = std::getenv("ASM_UPDATE_PACE");
+            const bool 批量化更新 = (pace_env == nullptr || std::string(pace_env) != "0");
+            if (批量化更新) {
+                // 分块：每块 64 个参数（一次性排队 1800 个任务会把主机内存打满）
+                std::vector<参数*> 批量子;
+                批量子.reserve(1024);
+                for (auto& q : 全部参数)
+                    if (q->miniI8) 批量子.push_back(q.get());
+                const char* chunk_env = std::getenv("ASM_UPDATE_CHUNK");
+                std::size_t 块大小 = chunk_env ? std::size_t(std::atoi(chunk_env)) : 64u;
+                if (块大小 == 0u) 块大小 = 64u;
+                for (std::size_t 起 = 0; 起 < 批量子.size(); 起 += 块大小) {
+                    const std::size_t 止 = std::min(批量子.size(), 起 + 块大小);
+                    for (std::size_t k = 起; k < 止; ++k) 批量子[k]->miniI8->派发归约();
+                    冲刷批();
+                    for (std::size_t k = 起; k < 止; ++k) 批量子[k]->miniI8->结算();
+                    for (std::size_t k = 起; k < 止; ++k) 批量子[k]->miniI8->派发应用();
+                }
+                if (跟踪更新)
+                    std::printf("[trace] 批量更新: %zu 个 i8 参数，块=%zu\n",
+                                批量子.size(), 块大小);
+            }
+            std::size_t 更新计数 = 0;
             for (auto& p : 全部参数) {
-                if (p->miniI8) { p->miniI8->步骤(); continue; }
+                if (跟踪更新 && (++更新计数 % 128u) == 0u)
+                    std::printf("[trace] upd 进度 %zu/%zu\n", 更新计数, 全部参数.size());
+                if (p->miniI8) {
+                    if (!批量化更新) p->miniI8->步骤();
+                    continue;
+                }
                 if (p->mini) { p->mini->步骤(); continue; }
                 if (p->量化) continue;   // 量化但没有 miniI8/mini（如 W1/W2）不更新
                 const float b1t = std::pow(beta1, float(step));
@@ -2488,10 +2527,10 @@ int main(int argc, char** argv) {
                         std::printf("  [mem] %-10s %.2f GiB\n", kv.first.c_str(), kv.second);
                     std::printf("  [mem] %-10s %.2f GiB\n", "合计", double(live) / (1024.0 * 1024.0 * 1024.0));
                 }
-                std::printf("3B cache 实测: fwd %.2f ms | bwd %.2f ms | loss %.6f | "
+                std::printf("%s 实测: fwd %.2f ms | bwd %.2f ms | loss %.6f | "
                             "params %zu | grad_elems %zu | nonfinite_logits %zu | "
                             "VK live %.2f GiB\n",
-                            fms, bms, loss, 全部参数.size(), grad_elems, bad,
+                            模式.c_str(), fms, bms, loss, 全部参数.size(), grad_elems, bad,
                             double(live) / (1024.0 * 1024.0 * 1024.0));
                 auto 打表 = [&](const char* 标签, double 总ms,
                                 const std::map<std::string,

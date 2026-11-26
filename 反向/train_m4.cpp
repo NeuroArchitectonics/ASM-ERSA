@@ -20,6 +20,8 @@
 #include "adamw_update.spv.hpp"
 #include "apollo_reduce.spv.hpp"
 #include "apollo_update.spv.hpp"
+#include "grad_norm_sq.spv.hpp"
+#include "grad_scale.spv.hpp"
 #include "linear_fwd_int8_f32.spv.hpp"
 #include "ApolloSolver.h"
 
@@ -79,6 +81,16 @@ struct 推送Int8 {
 static_assert(sizeof(推送Int8) == 20, "int8 线性 push");
 static_assert(sizeof(推送AdamW) == 36, "AdamW push");
 
+struct 推送梯度范数 {
+    std::uint32_t n0, n1, n2, n3;
+};
+struct 推送梯度缩放 {
+    std::uint32_t n0, n1, n2, n3;
+    float coef, pad0, pad1, pad2;
+};
+static_assert(sizeof(推送梯度范数) == 16, "grad_norm_sq push");
+static_assert(sizeof(推送梯度缩放) == 32, "grad_scale push");
+
 // ---------------------------------------------------------------------------
 // 配置：M3c 尺寸用于对拍；基准尺寸可换 T / DK / DV
 // ---------------------------------------------------------------------------
@@ -88,6 +100,7 @@ struct 配置 {
     std::uint32_t STEPS = 20;
     std::uint32_t B = 1, H = 1;
     float tau = 0.8f;
+    std::uint32_t seed = 31337u;   // 固定随机源；换 seed 可检查结论是否只对单次初始化成立
 };
 
 配置 M3c配置() { return 配置{}; }
@@ -154,7 +167,10 @@ public:
     void 重置();
     void 串行步(std::uint32_t 步序号);           // 基线：每算子提交 + 等待
     void 融合步(std::uint32_t 步序号, std::uint32_t 每串query数, bool 批式 = false);
-    void 启用Apollo();
+    void 启用Apollo(float 学习率 = 1e-3f, float sigma = 1e-3f,
+                    float 裁剪范数 = 0.0f, std::uint32_t 预热步数 = 0u,
+                    float b上界 = 3.402823466e38f);
+    void 设置AdamW学习率(float 值) { adamw学习率_ = 值; }
     void 启用Int8前向();
     void 刷新Int8权重();
     float 前向损失();
@@ -204,8 +220,14 @@ private:
                     std::uint32_t N, std::uint32_t K, std::uint32_t M) const;
     算子步骤 步AdamW(const vk张量& G, const vk张量& P, const vk张量& M, const vk张量& V,
                      std::uint32_t 个数, float 衰减, std::uint32_t 步序号) const;
+    算子步骤 步梯度范数() const;
+    算子步骤 步梯度缩放(float 系数) const;
 
     bool 用Apollo_ = false;
+    float adamw学习率_ = lr;     // AdamW 基线的 lr 可覆盖，用于公平的 lr 对照
+    float 学习率基准_ = 1e-3f;   // Apollo warmup 的基准 lr
+    float 裁剪范数_ = 0.0f;      // >0 时启用全局梯度裁剪
+    std::uint32_t 预热步数_ = 0;  // >0 时线性 warmup 到基准 lr
     算子步骤 步线性int8(const vk张量& xq, const vk张量& sx,
                       const vk张量& wq, const vk张量& sw,
                       const vk张量& 偏, const vk张量& 出,
@@ -225,6 +247,7 @@ private:
     vk张量 零偏DK_, 零偏DV_, dbk_, dbv_, dS_;
     vk张量 dWq_, dWk_, dWv_;
     vk张量 mWq_, vWq_, mWk_, vWk_, mWv_, vWv_, mS_, vS_;
+    vk张量 梯度范数_;   // grad_norm_sq 的 1 float 输出
     vk张量 sm_;
     vk张量 mFull_;   // [B,H,T,T] 全掩码，批式反传用
 
@@ -285,10 +308,11 @@ void 训练器::建图() {
     vWv_ = 建({DV, DX}, "vWv");
     mS_ = 建({1}, "mS");
     vS_ = 建({1}, "vS");
+    梯度范数_ = 建({1}, "grad_norm_sq");
     sm_ = 建({B, H}, "sinkbuf");
     mFull_ = 建({B, H, T, T}, "mask_full");
 
-    g_lcg = 31337u;   // 固定随机源：每次构造训练器拿到同一份数据
+    g_lcg = 参数_.seed;   // 固定随机源：同一 seed 每次构造训练器拿到同一份数据
     x_.assign(T * DX, 0.f);
     目标_.assign(T * DV, 0.f);
     Wq0_.assign(DK * DX, 0.f);
@@ -363,6 +387,12 @@ void 训练器::重置() {
     std::fill(dVh_.begin(), dVh_.end(), 0.f);
     dsink_ = 0.0f;
     std::fill(损耗_.begin(), 损耗_.end(), 0.f);
+
+    // Apollo 的 m/B/d 状态也要随训练器一并复位
+    if (apolloWq_) apolloWq_->重置();
+    if (apolloWk_) apolloWk_->重置();
+    if (apolloWv_) apolloWv_->重置();
+    if (apolloSink_) apolloSink_->重置();
 }
 
 // ---- 同步 / 提交 ----
@@ -445,10 +475,31 @@ float 训练器::读sink() const {
                          std::uint32_t 个数, float 衰减, std::uint32_t 步序号) const {
     const float m_corr = 1.0f / (1.0f - std::pow(beta1, float(步序号 + 1)));
     const float v_corr = 1.0f / (1.0f - std::pow(beta2, float(步序号 + 1)));
-    推送AdamW pc{lr, beta1, beta2, eps, m_corr, v_corr, 个数, 衰减, 1u};
+    推送AdamW pc{adamw学习率_, beta1, beta2, eps, m_corr, v_corr, 个数, 衰减, 1u};
     return 构造算子步骤("adamw_update",
                         {G.取句柄(), P.取句柄(), M.取句柄(), V.取句柄()}, pc,
                         派发规格{(个数 + 255u) / 256u, 1u, 1u});
+}
+
+// 全局梯度范数平方：4 个梯度张量一次归约到 梯度范数_[0]
+算子步骤 训练器::步梯度范数() const {
+    推送梯度范数 pc{参数_.DK * 参数_.DX, 参数_.DK * 参数_.DX, 参数_.DV * 参数_.DX, 1u};
+    return 构造算子步骤("grad_norm_sq",
+                        {dWq_.取句柄(), dWk_.取句柄(), dWv_.取句柄(), dS_.取句柄(),
+                         梯度范数_.取句柄()},
+                        pc, 派发规格{1u, 1u, 1u});
+}
+
+// 设备侧把 4 个梯度张量就地乘裁剪系数
+算子步骤 训练器::步梯度缩放(float 系数) const {
+    const std::uint32_t n0 = 参数_.DK * 参数_.DX;
+    const std::uint32_t n1 = 参数_.DK * 参数_.DX;
+    const std::uint32_t n2 = 参数_.DV * 参数_.DX;
+    const std::uint32_t n3 = 1u;
+    推送梯度缩放 pc{n0, n1, n2, n3, 系数, 0.0f, 0.0f, 0.0f};
+    return 构造算子步骤("grad_scale",
+                        {dWq_.取句柄(), dWk_.取句柄(), dWv_.取句柄(), dS_.取句柄()},
+                        pc, 派发规格{(n0 + n1 + n2 + n3 + 255u) / 256u, 1u, 1u});
 }
 
 std::vector<算子步骤> 训练器::前向步骤(float 当前sink) const {
@@ -575,13 +626,18 @@ void 训练器::反传上传梯度() {
 }
 
 // ---- 两条调度路径 ----
-void 训练器::启用Apollo() {
+void 训练器::启用Apollo(float 学习率, float sigma, float 裁剪范数, std::uint32_t 预热步数,
+                        float b上界) {
     用Apollo_ = true;
+    学习率基准_ = 学习率;
+    裁剪范数_ = 裁剪范数;
+    预热步数_ = 预热步数;
     ApolloSolver::配置 c;
     c.beta = beta1;
-    c.学习率 = 1e-3f;
-    c.sigma = 1e-3f;
+    c.学习率 = 学习率;
+    c.sigma = sigma;
     c.epsilon = eps;
+    c.b_max = b上界;
     apolloWq_ = std::make_unique<ApolloSolver>(Wq_, dWq_, 参数_.DK * 参数_.DX, c);
     apolloWk_ = std::make_unique<ApolloSolver>(Wk_, dWk_, 参数_.DK * 参数_.DX, c);
     apolloWv_ = std::make_unique<ApolloSolver>(Wv_, dWv_, 参数_.DV * 参数_.DX, c);
@@ -703,6 +759,28 @@ void 训练器::串行步(std::uint32_t 步序号) {
     反传上传梯度();
 
     if (用Apollo_) {
+        // Apollo 更新的是参数梯度：先由 dQ/dK/dV 与输入 X 算出 dW（与 AdamW 路径同一条 kernel），
+        // 再交给 solver。原实现漏了这三步，solver 拿到的是未更新的 dW。
+        提交单个(步dwdb(X_, dQd_, dWq_, dbk_, 参数_.T, 参数_.DX, 参数_.DK));
+        提交单个(步dwdb(X_, dKd_, dWk_, dbk_, 参数_.T, 参数_.DX, 参数_.DK));
+        提交单个(步dwdb(X_, dVd_, dWv_, dbv_, 参数_.T, 参数_.DX, 参数_.DV));
+        if (裁剪范数_ > 0.0f) {
+            // 全局梯度裁剪：设备侧归约 Σg² → 回读 1 float → 设备侧乘系数（梯度不上主机）
+            提交单个(步梯度范数());
+            float 平方和 = 0.0f;
+            梯度范数_.下载(&平方和, sizeof(float));
+            const float 范数 = std::sqrt(std::max(平方和, 0.0f));
+            const float 系数 = std::min(1.0f, 裁剪范数_ / (范数 + 1e-12f));
+            提交单个(步梯度缩放(系数));
+        }
+        const float 因子 = (预热步数_ > 0u)
+                               ? std::min(1.0f, float(步序号 + 1u) / float(预热步数_))
+                               : 1.0f;
+        const float 有效学习率 = 学习率基准_ * 因子;
+        apolloWq_->设置学习率(有效学习率);
+        apolloWk_->设置学习率(有效学习率);
+        apolloWv_->设置学习率(有效学习率);
+        apolloSink_->设置学习率(有效学习率);
         apolloWq_->步骤();
         apolloWk_->步骤();
         apolloWv_->步骤();
@@ -1007,17 +1085,46 @@ int main(int argc, char** argv) {
         }
 
         if (模式 == "apollo") {
-            const 配置 c = M3c配置();
-            训练器 甲(调度器, c);
-            甲.启用Apollo();
-            std::printf("== M4 + Apollo（T=%u，%u 步，lr=%.3f）==\n", c.T, c.STEPS, 训练器::lr);
-            for (std::uint32_t s = 0; s < c.STEPS; ++s) {
-                甲.串行步(s);
-                const auto& 历史 = 甲.损耗();
-                std::printf("  step %u: loss=%.8f\n", s + 1, 历史[s]);
+            const std::uint32_t T = (argc > 4) ? static_cast<std::uint32_t>(std::atoi(argv[4])) : 6u;
+            const std::uint32_t 步数 = (argc > 5) ? static_cast<std::uint32_t>(std::atoi(argv[5])) : 20u;
+            配置 c = M3c配置();
+            if (T != 6u) {
+                if (T % 8u != 0) { std::fprintf(stderr, "T 必须是 8 的倍数（BLOCK=8）\n"); return 2; }
+                c = 基准配置(T, 步数);
             }
-            const auto& 历史 = 甲.损耗();
-            std::printf("== Apollo 训练完成，最终 loss=%.6f ==\n", 历史.back());
+            c.STEPS = 步数;
+            if (argc > 7) c.seed = static_cast<std::uint32_t>(std::atoi(argv[7]));
+            std::vector<float> 学习率表;
+            if (argc > 3) 学习率表.push_back(static_cast<float>(std::atof(argv[3])));
+            else 学习率表 = {训练器::lr, 5e-3f, 1e-3f};
+            const float sigma = (argc > 6) ? static_cast<float>(std::atof(argv[6])) : 1e-3f;
+            const float 裁剪范数 = (argc > 8) ? static_cast<float>(std::atof(argv[8])) : 0.0f;
+            const std::uint32_t 预热步数 = (argc > 9) ? static_cast<std::uint32_t>(std::atoi(argv[9])) : 0u;
+            const bool 跑AdamW = (argc <= 10) || (std::atoi(argv[10]) != 0);
+            const float adamw学习率 = (argc > 11) ? static_cast<float>(std::atof(argv[11])) : 训练器::lr;
+            const float b上界 = (argc > 12) ? static_cast<float>(std::atof(argv[12])) : 3.402823466e38f;
+
+            std::printf("== M4 优化器对照（T=%u，%u 步，seed=%u，sigma=%.1e，clip=%.3g，warmup=%u，Bmax=%.3g，AdamW lr=%.4f）==\n",
+                        c.T, c.STEPS, c.seed, sigma, 裁剪范数, 预热步数, b上界, adamw学习率);
+
+            // AdamW 基线（默认 lr=0.02、wd=0.01；可用 argv[11] 覆盖做 lr 对照）
+            if (跑AdamW) {
+                训练器 甲(调度器, c);
+                甲.设置AdamW学习率(adamw学习率);
+                for (std::uint32_t s = 0; s < c.STEPS; ++s) 甲.串行步(s);
+                std::printf("AdamW  lr=%.4f wd=%.3f  loss:", adamw学习率, 训练器::wd);
+                for (float l : 甲.损耗()) std::printf(" %.6f", l);
+                std::printf("\n");
+            }
+
+            for (float lr_ap : 学习率表) {
+                训练器 乙(调度器, c);
+                乙.启用Apollo(lr_ap, sigma, 裁剪范数, 预热步数, b上界);
+                for (std::uint32_t s = 0; s < c.STEPS; ++s) 乙.串行步(s);
+                std::printf("Apollo lr=%.4f        loss:", lr_ap);
+                for (float l : 乙.损耗()) std::printf(" %.6f", l);
+                std::printf("\n");
+            }
             调度器.停止();
             return 0;
         }

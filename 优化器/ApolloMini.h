@@ -79,6 +79,7 @@ private:
     vk张量 R_;    // [R_len_]
     vk张量 归约_; // [2]
     vk张量 梯度范数_; // [1]
+    vk张量 行范数_;   // [R_len] 每行 Σg²
     float 上一缩放范数_ = 0.0f;   // Norm-Growth Limiter 的上一步 ||scaled_grad||
     std::vector<float> Phost_;
     bool 梯度bf16_ = false;   // 梯度缓冲为 bf16（uint16 位模式）

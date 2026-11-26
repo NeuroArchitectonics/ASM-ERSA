@@ -191,36 +191,10 @@ Bmax≥1e-2 与不启用逐位相同——B 上界不是瓶颈，冻结与 B 无
 - 顺带：`vkCreateShaderModule` 报 `Capability Int16 … shaderInt16` 告警 —— 该特性属于 **`VkPhysicalDeviceFeatures`**，
   不在 `VkPhysicalDeviceVulkan11Features` 里；已在 `流水线调度器.hpp` 加 `特性.shaderInt16 = VK_TRUE`，告警归零。
 
-### `adamw_update_bf16` 单测与「累加型内核为何留在 fp32」
+### 结果（不写实现细节）
 
-- `优化器/adamw_update_bf16_test.cpp`：N=4000（非 256 倍数）、缓冲 4096、5 步、lr=1e-3、wd=0.01，
-  CPU fp64 参考 + 尾部哨兵 + `zero_grad` 检查：
-  `max|Δp|=9.528e-08  max|Δm|=1.688e-10  max|Δv|=4.925e-13  非有限=0`
-  `越界写=0  g 未清零=0  g 越界写=0` → **ADAMW_BF16 PASS**。
-- 剩下的 fp32 梯度是设计选择，不是漏项：
-  - `embedding_bwd_scatter` 用 **atomic CAS** 累加（同 id 多 token 并发写同一行）。Vulkan core 没有 16 位原子加，
-    改 bf16 只能拆成两段（fp32 临时 + 二次 scatter），省下的只有 152064×2048×2 B ≈ **0.62 GB（20.66 GiB 的 3%）**，
-    却给梯度最稠密的参数引入二次舍入，收益不成立。
-  - `asm_step_bwd_*` / `ersa_*_bwd` / `gr_*` 的 dK/dV/dsink 等是**跨工作组累加**的小缓冲（每层几百 KB 量级），
-    寄存器和显存都没压力，不改。
-- 结论：bf16 梯度只用于「一次写定」的参数（线性四权、MoE W1/W2/sh*），累加型保持 fp32。
-
-### MoE 的 W1/W2 改用 ApolloMini（去掉 AdamW 的 m/v）
-
-- 之前 W1/W2 是 `量化=false` → p + m + v（≈12 B/param），1.61 B 参数就是 19 GB 量级。
-  现在 `用I8参数` 时对 MoE 也建 `ApolloMini`（fp32 master + rank-1 状态），并在建好后释放 m/v：
-  ```cpp
-  if (q->mini || q->miniI8) { q->m = vk张量(); q->v = vk张量(); }
-  ```
-- bf16 梯度支持：新增 `apollo_mini_apply_bf16`（fp32 w，uint16 g），`ApolloMini` 构造加 `梯度bf16` 标志，
-  按标志派发 `apollo_mini_{proj,gnorm,apply}_bf16`。
-- 实测 `VK live`（3b_cache，逐项叠加）：
-  | 配置 | VK live |
-  |---|---|
-  | bf16 梯度 + AdamW(m/v) | 36.80 GiB → 32.66 GiB |
-  | fp32 梯度 + ApolloMini | 24.80 GiB |
-  | bf16 梯度 + ApolloMini | **20.66 GiB** |
-  合计比最初省 **16.14 GiB（−44%）**。
-- 回归：`apollo_mini_test` 仍 PASS（`max|Δ|=8.046931e-07 @i=526`）；`3b_cache` PASS，
-  `ASM_DBG_MOE` 显示 `L0.moe_W1_i8 前4096和 -2512 → -2509 → -2507 → -2491`（专家仍在学）。
-- 4 步（seed 7）：bf16 g + mini `12.800 12.663 12.357 11.733`；fp32 g + mini `12.800 13.090 12.590 11.526`，均无 NaN/Inf。
+- 8B（24 层 / 192 专家 / top-4 / tied）：总参 **8.032B**、激活 **0.935B（11.6%）**、`VK live` **24.85 GiB**。
+- 3B 训练态 `VK live` **9.58 GiB**。
+- 8B 单步：fwd ~0.70 s、bwd 2.7–5.6 s、**upd 0.80 s**，合计 **4.2–7.1 s**（Radeon 780M）。
+- 正确性回归：`3b_cache` PASS（`loss 11.990150`）、8B 一步 `loss 13.702553`、无 NaN/Inf。
+- 已知未修：同一 seed 两步结果不完全可复现；偶发 `VK_ERROR_DEVICE_LOST`。

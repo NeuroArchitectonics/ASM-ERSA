@@ -15,11 +15,13 @@ public:
         float 学习率 = 1e-3f;
         float sigma = 1e-4f;
         float epsilon = 1e-8f;
+        float b_max = 3.402823466e38f;   // |B| 上界；FLT_MAX 等价不启用
     };
 
     ApolloSolver(vk张量& 参数, vk张量& 梯度, std::size_t 元素数, 配置 配置 = {});
 
     void 步骤();
+    void 设置学习率(float 学习率) { 配置_.学习率 = 学习率; }
     bool 参数有效() const;
     void 重置();
 

@@ -33,7 +33,11 @@ public:
                  std::uint32_t G, bool 梯度bf16,
                  MoE直写布局 moe布局);
 
-    void 步骤();
+    void 步骤();        // = 派发归约 + 结算 + 派发应用（单参数）
+    // 相位批量化：A 阶段一次性派发所有参数的 proj/stat/gnorm，B 阶段一次性派发 apply。
+    void 派发归约();    // proj + stat + gnorm（只录制，不同步）
+    void 结算();        // 下载归约结果 + NGL，得到 本步缩放_
+    void 派发应用();    // 用 本步缩放_ 派发 apply（只录制）
     void 重置();
     std::uint32_t 行数() const { return rows_; }
     std::uint32_t 列数() const { return cols_; }
@@ -79,9 +83,11 @@ private:
     std::uint32_t seed_;
     std::uint32_t G_ = 1;
     bool 梯度bf16_ = false;
+    float 本步缩放_ = 0.0f;   // 结算() 产出，派发应用() 使用
     MoE直写布局 moe布局_;
     配置 配置_;
     vk张量 P_, M_, V_, R_, 归约_, 梯度范数_;
+    vk张量 行范数_;   // [R_len] 每行 Σg²（proj 写，normsum 归约）
     float 上一缩放范数_ = 0.0f;
     std::vector<float> Phost_;
 };

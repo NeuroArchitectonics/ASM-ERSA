@@ -48,6 +48,7 @@ ApolloMini::ApolloMini(vk张量& 参数, vk张量& 梯度, std::uint32_t rows, s
     V_ = vk张量(张量布局::连续({R_len_}), 张量类型::浮点32, "apollo_mini_V");
     R_ = vk张量(张量布局::连续({R_len_}), 张量类型::浮点32, "apollo_mini_R");
     归约_ = vk张量(张量布局::连续({2u}), 张量类型::浮点32, "apollo_mini_out");
+    行范数_ = vk张量(张量布局::连续({R_len_}), 张量类型::浮点32, "mini_row_nrm");
     梯度范数_ = vk张量(张量布局::连续({1u}), 张量类型::浮点32, "apollo_mini_gnorm");
     重置();
 }
@@ -88,8 +89,8 @@ void ApolloMini::步骤() {
     const std::string 名apply = std::string("apollo_mini_apply") + 后缀;
     调度器.录制自定义派发算子(
         名proj.c_str(),
-        {P_.取句柄(), 梯度_->取句柄(), R_.取句柄()},
-        &ppc, sizeof(ppc), 派发规格{(R_len_ + 63u) / 64u, 1u, 1u});
+        {P_.取句柄(), 梯度_->取句柄(), R_.取句柄(), 行范数_.取句柄()},
+        &ppc, sizeof(ppc), 派发规格{R_len_, 1u, 1u});
 
     const StatPC spc{R_len_, 配置_.beta1, 配置_.beta2, m_corr, v_corr, 配置_.eps, 0u, 0u};
     调度器.录制自定义派发算子(
@@ -97,11 +98,13 @@ void ApolloMini::步骤() {
         {R_.取句柄(), M_.取句柄(), V_.取句柄(), 归约_.取句柄()},
         &spc, sizeof(spc), 派发规格{1u, 1u, 1u});
 
-    const GNormPC gpc{rows_ * cols_, 0u, 0u, 0u};
+    struct NormSumPC { std::uint32_t n, p0, p1, p2; };
+    static_assert(sizeof(NormSumPC) == 16, "normsum push");
+    const NormSumPC npc{R_len_, 0u, 0u, 0u};
     调度器.录制自定义派发算子(
-        名gnorm.c_str(),
-        {梯度_->取句柄(), 梯度范数_.取句柄()},
-        &gpc, sizeof(gpc), 派发规格{1u, 1u, 1u});
+        "apollo_mini_normsum",
+        {行范数_.取句柄(), 梯度范数_.取句柄()},
+        &npc, sizeof(npc), 派发规格{1u, 1u, 1u});
 
     float 范数[2] = {0.0f, 0.0f};
     归约_.下载(范数, sizeof(范数));

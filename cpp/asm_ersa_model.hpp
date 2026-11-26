@@ -55,6 +55,14 @@ inline ModelConfig ModelConfig6BLite() {
     return c;
 }
 
+// 8B：与 6B-lite 同骨架（24 层 / d=2048 / d_ff=384 / top-4 / tied），专家数 138→192。
+// 只增专家数不改 top-k，激活参数几乎不变（约 0.93B），总参 ≈ 8.0B。
+inline ModelConfig ModelConfig8B() {
+    ModelConfig c = ModelConfig6BLite();
+    c.n_experts = 192;
+    return c;
+}
+
 // 参数统计：与 make_random_weights 的 shape 一致；tied_embed=true 时 lm_head 与词嵌入共用一份。
 inline std::uint64_t count_params(const ModelConfig& c, bool tied_embed = true) {
     const std::uint64_t D = c.d_model, H = c.n_heads, DK = c.d_k, DV = c.d_v;
