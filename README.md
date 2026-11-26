@@ -44,33 +44,16 @@ ASM-ERSA 是一种混合 Transformer 架构：用可寻址槽位记忆（ASM）�
 | 总参数 | 3.22B（`build_model(TrainConfig())` 实测 3,219,116,392） |
 | 训练内存 | **9.58 GiB VK live**（Radeon 780M，seed=7，3B 训练器实测） |
 
-### 内存优化最新进展（2026-11-25）
-
-- 3B 训练态 VK live 从 **20.66 GiB 降到 9.58 GiB**，累计省 **11.08 GiB（约 53.7%）**。
-- 已通过 bf16 梯度全量非有限检查、四步训练和 `3B CACHE PASS`。
-
 ### 6B-lite 预设（2026-11-23）
 
-`TrainConfig6BLite()` / `ModelConfig6BLite()`：D=2048、F=384 不变，24 层、138 专家（top-4）、tied embedding。
-目标是在 ~6B 总参下把每 token 激活压到 1B 附近。
+`TrainConfig6BLite()` / `ModelConfig6BLite()`：D=2048、F=384 不变，24 层、138 专家（top-4）、tied embedding，总参 ~6B、每 token 激活 ~0.93B。
 
-| 口径 | 总参数 | 每 token 激活 | INT8 权重 | FP16 | 训练态（16B/param） |
-|---|---|---|---|---|---|
-| VK 主干（`main.exe <spv> 6b`） | 5.990B | **0.932B（15.6%）** | 6.18 GB | 11.98 GB | 95.8 GB |
-| Python Omni（含多模态头，meta 实测） | 6.125B | 1.066B（17.4%） | 6.31 GB | 12.25 GB | 98.0 GB |
+| 口径 | 总参数 | 每 token 激活 | INT8 权重 | FP16 权重 |
+|---|---|---|---|---|
+| VK 主干（`main.exe <spv> 6b`） | 5.990B | **0.932B（15.6%）** | 6.18 GB | 11.98 GB |
+| Python Omni（含多模态头，meta 实测） | 6.125B | 1.066B（17.4%） | 6.31 GB | 12.25 GB |
 
-- 结构代价：层数 32→24（深度 −25%）、专家 32→138（top-4，激活比例 4/138 ≈ 2.9%）、lm_head 与词嵌入共享（省 311M）。
-- 优化器：`optimizer='apollo_mini'`（`TrainConfig6BLite()`）；VK 训练器用 `ASM_OPT=apollo_mini`（`cpp/train_main.cpp`）。
-  APOLLO-Mini 是 rank-1 低秩辅助缩放（MLSys'25），状态 O(rows+cols)：6B-lite 约 **20–70 MB**。
-  注意它和「对角拟牛顿 Apollo」是两个同名不同算法。
-- **内存实测（`main.exe cpp/spv 6bmem`，本机 96 GB；780M 的 GTT 与主机共享同一物理内存，不能叠加算）**：
-  单阶段分配全部成功：fp32 参数 24.0 GB（RSS 24.0）、bf16 12.0 GB（RSS 12.0）、int8 6.0 GB（RSS 6.0）；
-  GPU int8 6.0 GB + fp32 梯度 24.0 GB（合计 30 GB）分配成功。
-  真实预算：6B 推理 int8 ≈ 12 GB（主机+GPU 同池）；训练 fp32 ≈ 48 GB（参数 24 + 梯度 24）、bf16 ≈ 26 GB。
-  结论：96 GB 内可装，瓶颈是 780M 带宽（~130 GB/s）。**不要**把主机占用和 GPU 占用相加成两份——GTT 就是系统内存。
-- **不提供 Python 训练路径**：PyTorch 只作 oracle（项目红线），Python 侧只保留 meta 参数核算与参考实现。
-- `main.exe <spv> 6b` 只打印参数/显存统计，不实例化 6B 权重（避免 24 GB fp32 内存）。
-- 推理侧：INT8 权重 6.2 GB；非专家常驻 0.92 GB 每 token 都要读，780M（~130 GB/s）的带宽下限约 7 ms/token。
+**内存要求**：推理 INT8 ≈ 12 GB（主机与 GPU 共用同一物理内存池）；训练 fp32 ≈ 48 GB、bf16 ≈ 26 GB。96 GB 内可装；780M 带宽 ~130 GB/s，推理下限约 7 ms/token。
 
 ### Vulkan 张量计算系统
 
@@ -175,7 +158,7 @@ print(outputs.shape)
 ```
 
 > 3B Vulkan 训练器已可在 Radeon 780M 上运行，实测 VK live 9.58 GiB。短程验收示例：
-> `ASM_PARAM=i8 ASM_OPT=apollo_mini ASM_GRAD=bf16 ASM_STEPS=4 cpp/build_train.bat 3b_train`
+> `ASM_SEED=7 ASM_STEPS=4 cpp/build_train.bat 3b_train`
 > Python `train_omni_3b.py --smoke` 仅保留为参考/oracle 冒烟，不是 Vulkan 运行时主路径。
 
 ### Omni 3B Training
@@ -199,7 +182,7 @@ python3 example_train.py --steps 4 --seed 7 --debug-bf16
 ```
 
 C ABI：`asm_trainer_create` → `asm_trainer_train_step` / `asm_trainer_get_stats` / `asm_trainer_save_checkpoint` / `asm_trainer_load_checkpoint` → `asm_trainer_destroy`。
-`asm_trainer_save_checkpoint(path)` 写出 ASM8BIN 权重（推理侧可直接加载）和 `<path>.opt` 优化器状态（APOLLO-Mini 低秩状态 + AdamW 矩 + 步数）；`asm_trainer_load_checkpoint(path)` 恢复权重、优化器状态与步数后续训。
+`asm_trainer_save_checkpoint(path)` 写出 ASM8BIN 权重（推理侧可直接加载）和 `<path>.opt` 优化器状态与步数；`asm_trainer_load_checkpoint(path)` 恢复权重、优化器状态与步数后续训。
 云主机仍需可用的 Vulkan GPU 驱动；同一进程只能创建一个 trainer。
 
 ## 🏗️ Architecture
